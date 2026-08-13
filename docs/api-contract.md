@@ -1,0 +1,1279 @@
+# CLI Contract
+
+`brag` has no HTTP/RPC API. Its external contract is its argv surface
+and its stdout/stderr behavior. This doc is the frozen spec of that
+contract across PROJ-001 and PROJ-002: what each command takes, what it prints, and
+what it exits with.
+
+## Overview
+
+- **Binary:** `brag` (homebrew formula: `bragfile`).
+- **Auth:** none.
+- **Versioning:** `brag --version`. Semver. v0.x while the contract is
+  still plastic.
+- **Exit codes:**
+  - `0` — success.
+  - `1` — user error (missing arg, no such entry, invalid flag value).
+  - `2` — internal error (DB open failed, I/O error, migration failed).
+
+## Global flags (all commands)
+
+| Flag | Env | Default | Purpose |
+|---|---|---|---|
+| `--db <path>` | `BRAGFILE_DB` | `~/.bragfile/db.sqlite` | DB file location. Parent dir is auto-created. |
+| `--version` | — | — | Print version and exit 0. |
+| `--help`, `-h` | — | — | Print help and exit 0. |
+
+Precedence: `--db` > `BRAGFILE_DB` > default (DEC-003).
+
+## Commands
+
+### `brag add` — capture a new entry
+
+**STAGE-001 (flags-only form):**
+
+```
+brag add --title "shipped the auth refactor" \
+         [--description "cut login latency p99 from 600ms to 120ms"] \
+         [--tags "auth,perf"] \
+         [--project "platform"] \
+         [--type "shipped"] \
+         [--impact "unblocked mobile v3 release"]
+```
+
+- `--title` is required. Everything else is optional.
+- Stdout on success: the inserted entry's ID, one line, no prefix (e.g.
+  `42`). This keeps piping trivial (`id=$(brag add --title ...)`).
+- **Milestone line (stderr, TTY-only).** When stderr is a terminal, a
+  successful `add` may print one short celebratory line to **stderr** on
+  crossing a total / streak / per-project milestone (or a quiet "first brag
+  today/this week" nudge). It never touches stdout, so `id=$(brag add ...)`
+  is unaffected, and it is **silent** under `--json`, on pipes, and on any
+  non-terminal stderr. See [DEC-023](../decisions/DEC-023-milestone-notifications-copy-and-semantics.md).
+- Exit 0 on success; 1 if `--title` is missing or empty; 2 on storage
+  error.
+
+**STAGE-002 (editor-launch form):**
+
+```
+brag add            # no entry-field flags → opens $EDITOR on a template buffer
+```
+
+Dispatch rule: if `--json` is set, runs in json mode (reads stdin).
+Else if any of `--title/-t`, `--description/-d`, `--tags/-T`,
+`--project/-p`, `--type/-k`, `--impact/-i` is set, runs in flag mode.
+Otherwise runs in editor mode. The persistent `--db` flag is a path
+override, not an entry field, so `brag add --db /tmp/x.db` still opens
+the editor. `--json` combined with any field flag exits 1 (user
+error).
+
+`brag` resolves the editor as `$EDITOR` → `$VISUAL` → `vi`, writes a
+template (a `net/textproto`-style header block plus blank-line
+separator plus empty body — see DEC-009 for the format) to a temp `.md`
+file, and spawns the editor against it. On save:
+
+- Successful save with a valid `Title:` header → row inserted; the
+  inserted ID is printed to stdout (mirrors flag-mode contract so
+  `id=$(brag add)` works); stderr carries only the TTY-only milestone
+  line (see the flag-mode note above), else empty; exit 0.
+- Saving byte-identical content (SHA-256 comparison — i.e. the
+  template was not modified) aborts cleanly: stderr prints
+  `Aborted.`, exit 0, DB untouched.
+- Saving a buffer that fails parse (missing or empty `Title:` header)
+  exits 1 (user error); the DB is unchanged.
+- Editor exec failure (e.g. `:cq` in vim with a modified buffer)
+  exits 2 (internal error); the DB is unchanged.
+
+**STAGE-003 (JSON stdin form):**
+
+```
+echo '{"title":"shipped"}' | brag add --json
+brag list --format json | jq '.[0]' | brag add --json
+```
+
+- `--json` reads a single JSON object from stdin and inserts it.
+  Required: `title` (non-empty). Optional: `description`, `tags`,
+  `project`, `type`, `impact` — all free-form text. Server-owned
+  fields (`id`, `created_at`, `updated_at`) are tolerated-and-ignored
+  if present, so `brag list --format json | jq '.[0]' | brag add
+  --json` round-trips without `jq del`.
+- Unknown keys are strict-rejected with the offending key named in
+  the error (catches typos like `"titl"` before they become silently-
+  missing entries).
+- `tags` stays a comma-joined string per
+  [DEC-004](../decisions/DEC-004-tags-comma-joined-for-mvp.md); array
+  form (`["a","b"]`) is rejected with an error naming DEC-004.
+- `--json` is mutually exclusive with field flags (`--title`,
+  `--description`, `--tags`, `--project`, `--type`, `--impact`).
+  Combining them exits 1.
+- Stdout on success: the inserted ID, one line, no prefix (same as
+  flag-mode contract).
+- Schema lock:
+  [DEC-012](../decisions/DEC-012-brag-add-json-stdin-schema.md).
+
+**STAGE-007 (cwd `--project` auto-fill):**
+
+When `--project` is not supplied, `brag add` resolves the current working
+directory against registered project locations (nearest-ancestor match,
+DEC-019) and auto-fills the entry's project from the matching project's
+name. This applies to all three input modes:
+
+- flag mode — fires only when `--project`/`-p` is not passed at all;
+  passing `-p` (even `-p ""`) is an explicit choice and is recorded
+  verbatim.
+- JSON mode — fires only when the stdin object has no non-empty
+  `"project"` field.
+- editor mode — fires only when the buffer's `Project:` header is empty.
+
+Auto-fill is silent (no stderr) and best-effort: if the cwd cannot be
+resolved or matches no registered project, the entry is saved with an
+empty project, exactly as before. An explicit project always wins over
+the cwd. See `brag project here` (SPEC-031) for the shared resolver.
+
+### `brag list` — list entries
+
+```
+brag list [-P|--show-project] [--format json|tsv] [--tag T] [--project P] [--type T] [--since 2026-01-01] [--author agent|human] [--limit N]
+```
+
+- `--tag`, `--project`, `--type` filter on exact field value
+  (tags filter uses exact tag-name membership via the normalized
+  `taggings` join — DEC-015 / SPEC-025).
+- `--since` accepts `YYYY-MM-DD` or a duration like `7d`, `2w`, `3m`.
+- `--author` distinguishes provenance authorship (SPEC-043): `agent`
+  selects entries carrying a reserved `agent:`/`model:` provenance tag
+  (the namespace the MCP `brag_add` tool stamps — DEC-024), `human`
+  selects entries carrying neither. Prefix-anchored, so a topic tag like
+  `agentic` does not count. Omitting the flag returns both. This is the
+  read half of the agent-native write path: `brag list --author agent
+  --format json | jq length` counts agent-authored entries.
+- `--limit` defaults to unlimited; useful for `brag list --limit 5`.
+- Order: `created_at DESC`.
+- Output (default / plain mode): one line per entry, tab-separated
+  columns: `<id>\t<created_at>\t<title>`.
+- With `-P` / `--show-project`: output becomes
+  `<id>\t<created_at>\t<project>\t<title>` (four tab-separated
+  columns). Empty project renders as `-`.
+- With `--format json`: pretty-printed JSON array, one object per
+  entry, 9 keys per object (`id, title, description, tags, project,
+  type, impact, created_at, updated_at`). Shape locked by
+  [DEC-011](../decisions/DEC-011-json-output-shape.md); same bytes
+  as `brag export --format json` on the same rows.
+- With `--format tsv`: header row
+  (`id\ttitle\tdescription\ttags\tproject\ttype\timpact\tcreated_at\tupdated_at`)
+  followed by one data row per entry. Field order matches `--format
+  json`. Empty fields render as the empty string between tabs (no
+  dash filler — that is plain-mode `-P` behavior only).
+- Unknown `--format` values exit 1 (user error).
+- STAGE-001 ships without filter flags — plumbing exists, flags are
+  added in STAGE-002.
+
+### `brag show <id>` — show a single entry (STAGE-002)
+
+```
+brag show 42
+```
+
+Prints the full entry as markdown (title as `# `, metadata as a small
+table, description as body). Exit 1 if the ID does not exist.
+
+### `brag edit <id>` — edit via $EDITOR (STAGE-002)
+
+```
+brag edit 42
+```
+
+The primary mechanism for updating entries in PROJ-001. Flag-based
+update (e.g. `brag update 42 -t "new"`) is a deferred polish spec;
+for now, every change goes through the editor round-trip.
+
+`brag` resolves the editor as `$EDITOR` → `$VISUAL` → `vi`, writes
+the entry to a temp `.md` file as a `net/textproto`-style header block
+plus markdown body (DEC-009), and spawns the editor against it. On
+save, it re-parses the buffer, preserves `id` and `created_at`,
+bumps `updated_at`, and writes the new field values via
+`Store.Update`.
+
+- Saving byte-identical content (SHA-256 comparison) aborts cleanly:
+  stderr prints `No changes.`, exit 0, DB untouched.
+- Saving a successful edit prints `Updated.` to stderr, exit 0.
+- If the saved buffer is missing or has an empty `Title:` header, the
+  command exits 1 (user error); the DB is unchanged.
+- If the editor exits non-zero (e.g. `:cq` in vim) the command exits
+  2 (internal error); the DB is unchanged.
+- Missing/non-numeric/non-positive `<id>` or a no-longer-existent
+  entry exit 1 (user error).
+
+### `brag delete <id>` — delete an entry (STAGE-002)
+
+```
+brag delete 42
+brag delete 42 --yes
+brag delete 42 -y
+```
+
+Prompts for confirmation on stdin unless `--yes` (`-y`) is passed.
+Exit 1 if the ID does not exist, the arg is invalid, or missing.
+Exit 0 (no error) if the user declines the confirmation prompt — a
+deliberate choice, not an error.
+
+### `brag search "query"` — full-text search (STAGE-002)
+
+```
+brag search "auth refactor"
+brag search "auth-refactor"
+brag search "latency" --limit 10
+```
+
+FTS5 query against `entries_fts`. Query semantics are locked by
+[DEC-010](../decisions/DEC-010-search-query-syntax.md): the CLI
+tokenizes the argument on whitespace, phrase-quotes each token, and
+joins with spaces so multi-word queries get AND semantics and
+hyphens / other FTS5 operators inside a token are treated as
+literal text. Power-user FTS5 operators are not exposed.
+
+- Takes a single positional query argument. Zero or multiple args
+  exit 1.
+- Empty / whitespace-only / quote-containing queries exit 1.
+- Same output shape as `list`: tab-separated
+  `<id>\t<created_at>\t<title>` to stdout, newline-terminated.
+- Order: FTS5 `rank` ascending (most relevant first), with `id DESC`
+  as the tie-break for determinism when ranks are equal (DEC-005).
+- `--limit N` caps the result count; `0` (the default) means
+  unlimited. Negative values exit 1.
+- Zero results is not an error: stdout empty, stderr empty, exit 0.
+- Exit codes: `0` on success OR zero results; `1` on user-facing
+  input problems (empty/quote/arg count/bad `--limit`); `2` on
+  storage failure.
+
+### `brag export` — export entries (STAGE-003)
+
+```
+brag export --format json                         # stdout: JSON array
+brag export --format json --out entries.json      # write to file
+brag export --format json --project platform      # filter before exporting
+brag export --format json --tag auth --since 30d
+
+brag export --format markdown                     # stdout: grouped markdown
+brag export --format markdown --flat              # stdout: flat chronological
+brag export --format markdown --out report.md     # write to file
+brag export --format markdown --project platform  # filter before exporting
+```
+
+- `--format` is required. Accepted values: `json`, `markdown`.
+- `--out <path>` optional; defaults to stdout. If set, overwrites any
+  existing file at the path without prompting.
+- `--flat` optional; markdown-only. Skips the default group-by-project
+  rendering in favor of a single `## Entries (chronological)` section.
+  Rejected with a user error when combined with `--format json`.
+- Accepts the same filter flags as `brag list` (`--tag`, `--project`,
+  `--type`, `--since`, `--limit`). `ListFilter` is shared verbatim
+  between the two commands.
+- JSON output shape locked by
+  [DEC-011](../decisions/DEC-011-json-output-shape.md); byte-identical
+  to `brag list --format json` on the same rows.
+- Markdown output shape locked by
+  [DEC-013](../decisions/DEC-013-markdown-export-shape.md): level-1
+  document heading, provenance block (`Exported:`, `Entries:`,
+  `Filters:`), `## Summary` with `**By type**` / `**By project**`
+  counts, then entries grouped under `## <project>` in alphabetical-ASC
+  order (`(no project)` last) with within-group chronological-ASC
+  ordering. `--flat` swaps grouping for a single
+  `## Entries (chronological)` wrapper.
+- Unknown or missing `--format` values exit 1 (user error).
+
+### `brag summary --range week|month` (STAGE-004)
+
+```
+brag summary --range week                          # last 7 UTC days, markdown
+brag summary --range month --format json           # last 30 UTC days, JSON envelope
+brag summary --range week --tag auth --project p   # compose filters
+```
+
+Rule-based digest of the rolling time window. Output is a markdown
+document (default) or single-object JSON envelope (`--format json`)
+carrying:
+
+- **Provenance:** `Generated:` (RFC3339), `Scope:` (week|month),
+  `Filters:` (echoed flags or `(none)`).
+- **Summary block:** counts by type and by project (DESC by count,
+  alphabetical-ASC tiebreak; `(no project)` last in the by-project
+  list).
+- **Highlights:** entry titles + IDs grouped by project,
+  chronological-ASC within group; descriptions are intentionally
+  elided for the "skim before pasting" goal.
+
+Flags:
+- `--range week|month` REQUIRED. `week` = last 7 UTC days from
+  `time.Now()`; `month` = last 30 UTC days. Rolling window, NOT
+  calendar week/month.
+- `--format markdown|json` defaults to `markdown`. JSON is a
+  single-object envelope (NOT an array — diverges from DEC-011's
+  list shape because aggregations carry metadata). Shape locked by
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md).
+- `--tag <token>`, `--project <name>`, `--type <name>` reuse `brag
+  list`'s `ListFilter` semantics. No `--since`/`--limit`/`--out` on
+  summary in MVP.
+- Output goes to stdout. Redirect with `>` if you want a file.
+
+Unknown or missing `--range` or `--format` values exit 1 (user error).
+
+### `brag review --week | --month` (STAGE-004)
+
+```
+brag review                                  # last 7 UTC days, markdown (silent default)
+brag review --week                           # explicit; same as bare
+brag review --month --format json            # last 30 UTC days, JSON envelope
+```
+
+Reflection digest: recent entries grouped by project, followed by
+three hard-coded reflection questions designed to be pasted into an
+external AI session for guided self-review. No LLM ships in the
+binary.
+
+Document structure:
+
+- **Provenance:** `Generated:` (RFC3339), `Scope:` (week|month),
+  `Filters: (none)` (review never accepts filter flags; the value is
+  constant).
+- **Entries:** under `## Entries`, per-project `### <project>` groups
+  with bulleted `- <id>: <title>` per entry. Group order alpha-ASC
+  with `(no project)` last; within-group entries chrono-ASC. Markdown
+  elides descriptions for compactness; the JSON form includes the
+  full per-entry shape.
+- **Reflection questions:** under `## Reflection questions`, three
+  hard-coded numbered questions. The questions ALWAYS render — even
+  when zero entries match — because the questions are the point of
+  the command.
+
+Flags:
+- `--week` and `--month` are mutually exclusive boolean flags. Bare
+  `brag review` silently defaults to `--week` (no stderr notice).
+  Rolling-window semantics: `--week` = last 7 UTC days; `--month` =
+  last 30 UTC days.
+- `--format markdown|json` defaults to `markdown`. JSON is the
+  single-object envelope locked by
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md), with
+  top-level keys `generated_at`, `scope`, `filters`,
+  `entries_grouped`, `reflection_questions`. Each item inside
+  `entries_grouped[].entries` is the DEC-011 9-key per-entry shape
+  ([DEC-011](../decisions/DEC-011-json-output-shape.md)).
+- Filter flags `--tag` / `--project` / `--type` are NOT accepted on
+  review — the digest is "the last 7/30 days, period." No `--out`
+  flag; output goes to stdout (redirect with `>` for a file).
+
+Unknown `--format` values, or `--week` and `--month` together, exit 1
+(user error).
+
+### `brag stats` (STAGE-004)
+
+```
+brag stats                        # lifetime corpus, markdown
+brag stats --format json          # lifetime corpus, JSON envelope
+```
+
+Lifetime panorama: six aggregations over the entire corpus — total
+entries, entries/week (rolling average over the corpus span), current
+and longest streak (consecutive local days with entries; the current
+streak stays alive through yesterday), top-5
+most-common tags, top-5 most-common projects, plus the corpus span
+(first entry, last entry, days). No LLM ships in the binary.
+
+Document structure:
+
+- **Provenance:** `Generated:` (RFC3339), `Scope: lifetime`
+  (hard-coded — stats has no time window),
+  `Filters: (none)` (hard-coded — stats accepts no filter flags).
+- **Stats body** (markdown only; omitted on empty corpus per
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md)): under
+  `## Stats`, five bold sub-headers (`**Activity**`, `**Streaks**`,
+  `**Top tags**`, `**Top projects**`, `**Corpus span**`) with bulleted
+  metric content under each.
+
+Flags:
+
+- `--format markdown|json` defaults to `markdown`. JSON is the
+  single-object envelope locked by
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md). Top-level
+  keys: `generated_at`, `scope` (always `"lifetime"`), `filters`
+  (always `{}`), `total_count`, `entries_per_week` (decimal weeks
+  rolling average rounded to 2 decimals; sub-1-week corpus → `0`),
+  `current_streak`, `longest_streak`, `top_tags`, `top_projects`,
+  `corpus_span`.
+- `top_tags` and `top_projects` are arrays of `{tag, count}` /
+  `{project, count}` objects in DESC-by-count order with alpha-ASC
+  tiebreak. Strict cap at 5 (alpha-ASC determines which 5 when the
+  boundary count ties); array shape (rather than map keyed by name)
+  preserves the DESC-by-count ordering, which a map encoding would
+  lose under `encoding/json`'s alpha-sort.
+- `corpus_span` is a sub-object with `first_entry_date`,
+  `last_entry_date` (`"YYYY-MM-DD"` UTC, or `null` on empty corpus),
+  and `days` (int, inclusive on both endpoints; single-day corpus
+  → `1`).
+- Lifetime corpus only — no `--range`, no `--week`/`--month`. Use
+  `brag summary --range week|month` for windowed digests; `brag
+  review --week|--month` for reflection over recent windows.
+- Filter flags `--tag` / `--project` / `--type` are NOT accepted on
+  stats — the value of stats is the unfiltered lifetime view. No
+  `--out` flag; output goes to stdout (redirect with `>` for a file).
+
+Unknown `--format` values exit 1 (user error). Undeclared flags
+(`--tag`, `--project`, `--type`, `--out`, `--range`, `--since`,
+`--week`, `--month`) surface as cobra `unknown flag` errors.
+
+### `brag impact --quarter|--month|--year|--since <date>` (STAGE-011)
+
+```
+brag impact --quarter                              # this calendar quarter, markdown
+brag impact --quarter --previous                   # the whole previous calendar quarter
+brag impact --year --format json                   # this calendar year, JSON envelope
+brag impact --since 2026-01-01 --project alpha     # since a date, one initiative
+```
+
+Rule-based impact digest for a calendar reporting period: the in-window
+entries that carry a non-empty `impact` statement, grouped by initiative
+(= the `project` field), with each impact rendered in full. The fourth
+DEC-014 consumer; the deterministic data foundation the v0.4.0 story
+surface reads. No LLM ships in the binary.
+
+Document structure:
+
+- **Provenance:** `Generated:` (RFC3339), `Scope:`
+  (`quarter`|`month`|`year`|`since:<raw>`), `Filters:` (echoed flags or
+  `(none)`), and an `Entries: <shown>/<in-window> with impact` tally so
+  impact-less in-window rows are counted, never silently dropped.
+- **Impact body** (markdown; omitted when zero with-impact entries per
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md)): under
+  `## Impact`, per-project `### <project>` groups (alpha-ASC,
+  `(no project)` last; chrono-ASC + ID-tiebreak within group), each
+  entry as `- <id>: <title>` followed by an indented `  <impact>` line.
+
+Flags:
+
+- Exactly one window is REQUIRED and the four are MUTUALLY EXCLUSIVE
+  (passing two exits 1, user error):
+  - `--quarter` = the current calendar quarter (Jan-Mar / Apr-Jun /
+    Jul-Sep / Oct-Dec), `[quarter-start 00:00:00 UTC, now]`.
+  - `--month` = the current calendar month, `[first-of-month, now]`.
+  - `--year` = the current calendar year, `[Jan-1, now]`.
+  - `--since <date>` = entries on or after `<date>` (`YYYY-MM-DD` or
+    `Nd`/`Nw`/`Nm`, DEC-008's `ParseSince`), up to now.
+  Windows are CALENDAR periods, NOT rolling — a deliberate, tested
+  divergence from `brag summary`/`review` (whose windows are rolling),
+  because the story surface reports by the calendar periods audiences
+  name. Locked by
+  [DEC-028](../decisions/DEC-028-impact-digest-window-and-shape.md).
+- `--previous` shifts the selected window to the **last-completed** period,
+  as a **bounded** `[prev-start, prev-end)` window whose exclusive upper
+  bound is the current period's start (so current-period entries are
+  excluded): `--quarter --previous` = the whole previous calendar quarter,
+  `--month --previous` = the previous month, `--year --previous` = the
+  previous year. The boundary is computed via `time.Date`+`AddDate` (rolls
+  year boundaries; a January `--month --previous` lands in the prior
+  December of the prior year). `--previous` REQUIRES a window flag (a
+  modifier is not a window — `impact --previous` alone is the same
+  "exactly one window required" error) and is INCOMPATIBLE with `--since`
+  (an explicit anchor, not a calendar period → user error). The `scope`
+  echoes the shift: `quarter:previous` / `month:previous` / `year:previous`.
+  Locked by
+  [DEC-032](../decisions/DEC-032-previous-window-modifier.md).
+- `--format markdown|json` defaults to `markdown`. JSON is the
+  single-object envelope locked by
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md). Top-level
+  keys: `generated_at`, `scope`, `filters`, `entries_in_window`,
+  `entries_with_impact`, `counts_by_project` (a `map[string]int` over
+  the with-impact subset, alpha-ASC by key under `encoding/json`), and
+  `impact_by_project` (an array of `{project, entries:[...]}` groups in
+  group order). Each entry inside `impact_by_project[].entries` is a
+  deliberately NARROW 4-key projection `{id, title, project, impact}` —
+  NOT DEC-011's 9-key shape — locked by
+  [DEC-028](../decisions/DEC-028-impact-digest-window-and-shape.md).
+- `--tag <token>`, `--project <name>`, `--type <name>` compose with the
+  window and echo into `filters` exactly as `brag summary` does. The
+  filter narrows the in-window set before the impact-first split.
+- Output goes to stdout. Redirect with `>` if you want a file.
+
+Empty-window / no-impact: provenance always renders (both tally counts
+`0`); the `## Impact` body is omitted from markdown; JSON renders
+`entries_in_window`/`entries_with_impact` as `0`, `counts_by_project` as
+`{}`, `impact_by_project` as `[]`.
+
+Unknown or missing window flags, or an unknown `--format` value, exit 1
+(user error).
+
+### `brag wrapped [<year>] [Q<n>]` (STAGE-013)
+
+```
+brag wrapped                                       # the current calendar year, markdown
+brag wrapped --previous                            # the last-completed calendar year
+brag wrapped 2026 --format json                    # calendar year 2026, JSON envelope
+brag wrapped 2026 Q3 --project alpha               # one quarter, one initiative
+```
+
+Shareable, celebratory year- or quarter-in-review digest over a **named**
+calendar period: your year in brags. The fifth DEC-014 consumer, the
+shareable counterpart to `brag impact`. Rule-based, deterministic, no
+LLM.
+
+Document structure:
+
+- **Provenance:** `Generated:` (RFC3339), `Scope:` (`<year>` or
+  `<year>-Q<n>`, e.g. `2026` / `2026-Q3`), `Filters:` (echoed flags or
+  `(none)`), and a headline `Entries: N` count.
+- **Body** (markdown; omitted entirely on an empty period per
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md)), the
+  celebratory section arc:
+  - `## Cadence` — a `Busiest month: <YYYY-MM> (N)` line, then (in
+    markdown, default-on) a `Cadence: <glyphs>` Unicode block-glyph
+    **sparkline** (`▁▂▃▄▅▆▇█`, one glyph per bucket, min→max normalized)
+    over the same counts, then a per-month `- <YYYY-MM>: N` bucket
+    **series** (12 buckets for a year, 3 for a quarter, zero-filled). The
+    sparkline is markdown-only — JSON stays raw counts (no glyphs).
+  - `## Top initiatives` — top-5 projects by count, `- <project>: N`,
+    excluding `(no project)`.
+  - `## Impact moments` — with-impact entries grouped by initiative
+    (`### <project>`), each as `- <id>: <title>` plus an indented
+    `  <impact>` line, impact text in full.
+  - `## Rhythm` — `Longest streak: N days`, then `**Top tags**` (top-5)
+    and `**Top types**` (top-3) count lists.
+  - `## Span` — `- First entry:` / `- Last entry:` (`YYYY-MM-DD`) and
+    `- Active days: N`.
+
+Period selection:
+
+- The period is named **positionally** (deliberately NOT `impact`'s
+  `--year`/`--quarter` flags, which mean "current period up to now"):
+  - no argument = the **current calendar year**;
+  - `<year>` = a 4-digit year in `[2000,2999]` = that whole calendar year;
+  - `<year> Q<n>` = a case-insensitive quarter token (`Q1`..`Q4`, `q3`
+    accepted) = that calendar quarter.
+- The window is **bounded on both ends** — `[period-start, next-boundary)`
+  — so a completed year/quarter does not spill past its end (`brag
+  wrapped 2026` run in 2027 covers Jan–Dec 2026 only). This is the
+  deliberate divergence from `impact`'s `[cutoff, now]`, locked by
+  [DEC-030](../decisions/DEC-030-wrapped-period-selection-and-section-taxonomy.md).
+  The lower bound is a `Since` SQL filter; the exclusive upper bound is
+  applied in Go in the CLI layer (SQL-free).
+- `--previous` (with NO positional period) covers the **last-completed
+  calendar year** — `brag wrapped --previous` in 2026 is byte-identical to
+  `brag wrapped 2025`, `scope` `2025` (the concrete year, NOT a
+  `:previous` suffix — wrapped names a concrete period). It is ANNUAL-only
+  and valid ONLY with no positional arg: pairing it with an explicit
+  period (`brag wrapped 2026 --previous`, `brag wrapped 2026 Q3
+  --previous`) exits 1 (user error), since the positional arg already
+  names a bounded period. A previous *quarter* is named positionally
+  (`brag wrapped 2026 Q2`). Locked by
+  [DEC-032](../decisions/DEC-032-previous-window-modifier.md).
+
+Flags:
+
+- `--format markdown|json` defaults to `markdown`. JSON is the
+  single-object envelope. Top-level keys: `generated_at`, `scope`,
+  `filters`, `total_entries`, `cadence` (`{busiest_month, series:[{period,
+  count}]}`), `top_initiatives` (`[{project, count}]`), `impact_moments`
+  (`[{project, entries:[{id, title, project, impact}]}]`),
+  `longest_streak`, `top_tags` (`[{name, count}]`), `top_types`
+  (`[{name, count}]`), `span` (`{first_entry_date, last_entry_date,
+  active_days}`). On an empty period arrays are `[]`,
+  `busiest_month`/date fields are `null`, numbers `0` — but
+  `cadence.series` is still the full zero-filled month series so the
+  sparkline slot is present.
+- `--tag <token>`, `--project <name>`, `--type <name>` compose with the
+  period and echo into `filters` exactly as `brag impact` does.
+- `--no-spark` suppresses the markdown cadence sparkline (the
+  `Cadence: <glyphs>` line); the rest of the digest is unchanged. A
+  present `NO_COLOR` env var (any value, per no-color.org) suppresses it
+  too — either signal alone is enough. The sparkline is markdown-only and
+  never enters the JSON envelope, so `--no-spark`/`NO_COLOR` have no
+  effect on `--format json`.
+- Output goes to stdout. Redirect with `>` if you want a file.
+
+A malformed period (bad year, `Q0`/`Q5`, extra tokens) or an unknown
+`--format` value exits 1 (user error), stdout empty.
+
+### `brag coverage --quarter|--month|--year|--since <date>` (STAGE-013)
+
+```
+brag coverage --year                               # this calendar year, markdown
+brag coverage --quarter --previous                 # the whole previous quarter
+brag coverage --since 2026-01-01 --format json     # since a date, JSON envelope
+```
+
+Rule-based, calendar-windowed digest of **provenance share** — how much of
+your work over the period was agent-authored vs human-authored, and how
+that share is trending month by month. The **sixth** DEC-014 consumer;
+rule-based, deterministic, no LLM, no schema change. An entry counts as
+**agent-authored** iff it carries a reserved `agent:`/`model:` provenance
+tag ([DEC-024](../decisions/DEC-024-agent-provenance-namespace.md)); the
+classifier is single-sourced with `brag list --author` — `aggregate.IsAgentAuthored`
+(Go) is kept in agreement with storage's `provenanceExistsClause` (SQL) by
+a cross-package drift-guard test. Locked by
+[DEC-033](../decisions/DEC-033-coverage-metric-definition-and-surface.md).
+
+Document structure:
+
+- **Provenance:** `Generated:` (RFC3339), `Scope:` (the DEC-028/DEC-032
+  window token — `year`, `quarter:previous`, `since:<raw>`, …),
+  `Filters:` (echoed flags or `(none)`), and a headline `Entries: N`
+  count.
+- **Body** (markdown; omitted entirely on an empty window per
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md)):
+  - `## Provenance share` — `- Agent-authored: N (P%)` and
+    `- Human-authored: N (P%)` (one-decimal `%`).
+  - `## Monthly trend` — (in markdown, default-on) an
+    `Agent share: <glyphs>` Unicode block-glyph **sparkline** over the
+    per-month agent share (share×100, min→max normalized), then a per-month
+    `- <YYYY-MM>: <a> agent / <h> human (P%)` **series** (one bucket per
+    scope month, zero-filled, whole-percent share). The sparkline is
+    markdown-only — JSON stays raw counts+shares (no glyphs).
+  - `## Self-reference` — `- Entries mentioning brag/bragfile: N (P%)`:
+    a dogfooding-density proxy (entries whose title or description contains
+    `brag`, case-insensitive substring).
+
+Window selection:
+
+- Exactly ONE of `--quarter`/`--month`/`--year`/`--since` is **required**
+  and they are **mutually exclusive** — the same CALENDAR windows as `brag
+  impact` (`[cutoff, now]`, current in-progress period; `--since` via
+  ParseSince). Locked by
+  [DEC-028](../decisions/DEC-028-impact-calendar-windows.md).
+- `--previous` shifts the selected window to the **last-completed period**,
+  bounded `[prev-start, prev-end)` (same semantics as `brag impact
+  --previous`). It requires a window flag and is incompatible with
+  `--since` (an explicit anchor, not a calendar period). Locked by
+  [DEC-032](../decisions/DEC-032-previous-window-modifier.md).
+
+Flags:
+
+- `--format markdown|json` defaults to `markdown`. JSON is the
+  single-object envelope. Top-level keys: `generated_at`, `scope`,
+  `filters`, `total_entries`, `agent_entries`, `human_entries`,
+  `agent_share` (4-decimal fraction), `by_month` (`[{period, agent, human,
+  share}]`, always the full zero-filled month series), `self_reference`
+  (`{count, share}`). On an empty window numbers are `0`, `filters` `{}`,
+  and `by_month` is still the full zero-filled series.
+- `--tag <token>`, `--project <name>`, `--type <name>` compose with the
+  window and echo into `filters` exactly as `brag impact` does.
+- `--no-spark` suppresses the markdown agent-share sparkline (the
+  `Agent share: <glyphs>` line); the rest of the digest is unchanged. A
+  present `NO_COLOR` env var (any value, per no-color.org) suppresses it
+  too — either signal alone is enough. The sparkline is markdown-only and
+  never enters the JSON envelope, so `--no-spark`/`NO_COLOR` have no effect
+  on `--format json` ([DEC-031](../decisions/DEC-031-sparkline-primitive.md)
+  choice f).
+- Output goes to stdout. Redirect with `>` if you want a file.
+
+Coverage reads all in-window rows once and classifies in Go (it needs both
+classes to compute a share), so it does NOT set `ListFilter.Author` — but
+its classifier means exactly what `brag list --author` means. Zero windows,
+two windows, `--previous --since`, or an unknown `--format` value exits 1
+(user error), stdout empty.
+
+### `brag spark [--week|--month|--quarter] [--project <name>] (STAGE-016)`
+
+```
+brag spark                                  # last 28 days, weekly bars, markdown
+brag spark --week                           # last 7 days, one bar per day
+brag spark --quarter --project alpha        # 13 weekly bars: Total vs alpha
+brag spark --month --format json            # raw per-bucket counts, JSON envelope
+```
+
+A sparklines-only **pulse** of recent activity: a `Total` row plus up to
+the top-8 by-project rows, each a compact Unicode block-glyph **sparkline**
+over a **rolling** recent window with the row's entry count in parentheses.
+The **seventh** DEC-014 consumer; rule-based, deterministic, no LLM, no
+schema change. A quick "what does my last stretch look like?" glance, not a
+full digest. Locked by
+[DEC-037](../decisions/DEC-037-brag-spark-rolling-windows-and-multirow-pulse.md).
+
+Document structure:
+
+- **Provenance:** `Generated:` (RFC3339), `Scope:` (the rolling-window
+  token — `week`/`month`/`quarter`), `Filters:` (`--project <name>` when
+  set, else `(none)`), and a headline `Entries: N` count (the whole
+  in-window corpus, matching the `Total` row's sum).
+- **Body** (markdown; omitted entirely on an empty window per
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md)):
+  - `## Pulse` — a `Total (<count>): <glyphs>` row followed by
+    `<project> (<count>): <glyphs>` rows. Each row's sparkline is scaled to
+    its own min→max shape; the parenthesized count is the sum of that row's
+    buckets, so a steady project and a bursty one are both legible. Every
+    row is bucketed over the **same** shared axis, so glyph position *i* is
+    the same time bucket in every row. `(no project)` renders last.
+
+Window selection (**rolling**, ending now — NOT a calendar period):
+
+- Exactly one of `--week`/`--month`/`--quarter` may be given; they are
+  **mutually exclusive** and default to `--month`. Each maps to a fixed
+  (bucket-width, bucket-count) axis ending at now:
+  - `--week` → last **7 days**, **7 daily** bars.
+  - `--month` → last **28 days**, **4 weekly** bars (default).
+  - `--quarter` → last **91 days**, **13 weekly** bars.
+- Note `--month` here is a **rolling 28 days** — deliberately different from
+  `brag review`'s rolling 30 days and the calendar month in
+  `impact`/`coverage`/`wrapped` (DEC-037; the `Scope:`/`Generated:` lines
+  disambiguate).
+
+Flags:
+
+- `--project <name>` is a **row selector, not a corpus filter**: the
+  by-project rows collapse to that one project (`Total` still spans the
+  whole in-window corpus, so it reads as "this project vs everything"). A
+  named project with zero in-window entries still renders (an all-`▁` /
+  zero-count row). This diverges from the corpus-filtering `--project` on
+  `coverage`/`wrapped`/`impact` — see DEC-037 choice 3.
+- `--format markdown|json` defaults to `markdown`. JSON is the single-object
+  envelope. Top-level keys: `generated_at`, `scope`, `filters`, `window`
+  (`{buckets, bucket_width_days, start, end}`), `total` (`{count, series}`),
+  `by_project` (`[{project, count, series}]`). Each `series` is the **raw
+  per-bucket int array** — JSON never contains glyphs
+  ([DEC-031](../decisions/DEC-031-sparkline-primitive.md) choice f). On an
+  empty window `total.series` is the full zero-filled series, `by_project`
+  is `[]`, and `filters` is `{}`.
+- `--no-spark`, or a present `NO_COLOR` env var (any value, per
+  no-color.org), drops the glyphs and prints the **raw per-bucket counts**
+  instead (a sparkline-only command that suppressed its glyphs still emits
+  its data). No effect on `--format json` (already raw).
+- Output goes to stdout. Redirect with `>` if you want a file.
+
+The window is queried once via `ListFilter{Since: now - width*n}` (no SQL in
+the CLI layer); the pure `aggregate.RollingBuckets` bucketer assigns each
+entry to `[start+k*width, start+(k+1)*width)` (lower-inclusive,
+upper-exclusive). Two windows, an empty `--project`, or an unknown
+`--format` value exits 1 (user error), stdout empty.
+
+### `brag story --audience <name> [window] [--theme <tag>]` (STAGE-012)
+
+```
+brag story --audience me                                   # candid, this year (me's default window)
+brag story --audience me --previous                        # me, the last-completed default period
+brag story --audience manager --month                      # tactical update for a 1:1, this month
+brag story --audience exec --quarter                       # exec, this calendar quarter
+brag story --audience exec --quarter --previous            # exec, the whole previous quarter
+brag story --audience exec --year --format json            # arc-aware JSON envelope
+brag story --audience me --theme perf                      # add a cross-project perf arc
+brag story --audience exec --print-directive               # just the framing directive
+```
+
+Audience-shaped narrative bundle: the in-window corpus coalesced into
+**threads** (initiatives = the `project` field, time-ordered, with
+**impact beats** marked) plus a **throughline skeleton** and a
+per-audience **framing directive**. Where `brag impact` reports the
+grouped data, `brag story` shapes it into an arc for an LLM (already in
+the caller) to weave into prose. bragfile owns data + shaping; the LLM
+owns words — **no model, no network in the binary** (DEC-001). The bundle
+is a complete, readable artifact standalone; the LLM is the optional
+upgrade. Emitted by
+[DEC-029](../decisions/DEC-029-story-audience-shaping-profiles-and-thread-definition.md);
+extends DEC-014's envelope with an arc-aware body.
+
+Document structure (markdown):
+
+- **Provenance:** `Generated:` (RFC3339), `Scope:` (the resolved window
+  token), `Audience:` (the requested name), `Filters:` (echoed flags or
+  `(none)`), `Threads: <n>`, and a `Beats: <shown>/<in-window>` tally.
+- **Threads** (`## Threads`; omitted on an empty corpus per DEC-014):
+  per-thread `### <thread>` blocks. Each beat renders `- ★ <id>: <title>`
+  with an indented impact line when it carries a non-empty `impact`, or
+  `- · <id>: <title>` when it does not (the ★/· markers are the visible
+  "so what" signal).
+- **Throughline** (`## Throughline (skeleton)`; omitted on an empty
+  corpus): one line per thread — `- <thread> [<kind>]: <n> beats, <m>
+  with impact (<first> → <last>)` — the ordered thread refs + span +
+  beat/impact counts. The skeleton is deterministic; the LLM (via the
+  directive) finds the actual arc.
+- **Framing directive** (`## Framing directive`): the audience's directive
+  text appended verbatim. Renders even on an empty corpus; omitted only
+  when the resolved directive itself is empty.
+
+Audiences are **data-driven shaping profiles**, NOT a Go enum: `me`/`exec`
+load from bundled `embed.FS` assets; a user `<name>.yaml` in the
+story-profiles override directory shadows a bundled default by name
+(override-wins). A profile is a flat `key: value` file (selection +
+threading + altitude + directive pointer). The four bundled built-ins
+span the audience gradient (`me`/`exec` are the endpoints; `manager`/`skip`
+are the middle):
+
+- `me` — candid reflection: every thread, impact-less beats KEPT, low
+  altitude; default window `year`.
+- `manager` — tactical 1:1 / weekly: keep-all body like `me` (every thread
+  and beat, including the blocked/in-progress work), but a tighter reporting
+  cadence and a tactical directive voice; default window `month`.
+- `skip` — skip-level / director: fold zero-impact threads (like `exec`) but
+  KEEP the non-impact beats inside surfaced initiatives (unlike `exec`),
+  grouped by initiative; outcomes-by-initiative "so what"; default window
+  `quarter`.
+- `exec` — impact-forward promotion: impact-bearing threads only,
+  impact-less beats DROPPED, small threads folded, one headline arc
+  (threads ordered impact-beat-count DESC); default window `quarter`.
+
+Flags:
+
+- `--audience <name>` is REQUIRED. An unknown audience (no bundled
+  default, no override file) exits 1 (user error) naming the audience.
+- Window flags (`--quarter`/`--month`/`--year`/`--since`) are the same
+  CALENDAR periods as `brag impact` and MUTUALLY EXCLUSIVE. With no
+  window flag, the audience profile's DEFAULT window applies (`me` →
+  `year`, `manager` → `month`, `skip` → `quarter`, `exec` → `quarter`);
+  `scope` echoes the resolved token.
+- `--previous` shifts the resolved window — an explicit flag OR the
+  profile default — to the **last-completed** period, bounded
+  `[prev-start, prev-end)` (same semantics as `brag impact --previous`).
+  Unlike `impact`, `story --previous` alone is VALID: it shifts the
+  profile default back one period (`--audience me --previous` → the
+  last-completed year). INCOMPATIBLE with `--since` (user error). `scope`
+  echoes `quarter:previous` / `month:previous` / `year:previous`. Locked
+  by [DEC-032](../decisions/DEC-032-previous-window-modifier.md).
+- `--theme <tag>` appends exactly ONE cross-project thread (kind `theme`)
+  after the initiative threads, grouping every in-window entry carrying
+  that tag, time-ordered. Not subject to fold/drop (an explicit opt-in).
+- `--format markdown|json` defaults to `markdown`. The JSON envelope
+  extends DEC-014 with `audience`, `threads` (each `{thread, kind, span,
+  beats:[...]}`), `throughline` (`{arcs:[...]}`), and `framing_directive`,
+  2-space indent. Each beat is a 7-key projection `{id, title, project,
+  type, impact, is_impact_beat, created_at}`.
+- `--print-directive` prints ONLY the resolved framing directive to
+  stdout and exits 0 — no window, no DB read.
+- `--tag`/`--project`/`--type` compose with the window and echo into
+  `filters`.
+
+Empty-window: provenance renders (`Threads: 0`, `Beats: 0/0`); the
+`## Threads` and `## Throughline` sections are omitted from markdown; the
+`## Framing directive` section still renders. JSON renders `threads` `[]`,
+`throughline.arcs` `[]`, `framing_directive` the directive string,
+`filters` `{}`.
+
+### `brag tags` — tag taxonomy view (STAGE-006)
+
+```
+brag tags                         # name<TAB>count rows, most-used first
+brag tags --format json           # naked JSON array of {tag, count}
+```
+
+Lists every in-use tag with its total usage count across all entries, one per
+line as `<name>\t<count>`, sorted by count (descending) then name (ascending).
+Tags with no remaining memberships (orphans) are omitted — only in-use tags appear.
+Counts span all taggable object types (only `'entry'` today; `'project'` rows
+fold in automatically with STAGE-007 (shipped), with no change here).
+
+Flags:
+
+- `--format json` — emits a naked JSON array of `{"tag": <name>, "count": <n>}`
+  objects (DEC-011 naked-array discipline; 2-space indent; `[]` on empty corpus,
+  never `null`). The `{tag,count}` element shape matches DEC-014's `top_tags`.
+- Default (no `--format`) — plain tab-separated `name\tcount` rows on stdout.
+
+Unknown `--format` values exit 1 (user error). stdout carries data; stderr is
+empty on success.
+
+### `brag tag rename <old> <new>` — rename a tag everywhere (STAGE-006)
+
+```
+brag tag rename auth authz
+```
+
+Renames the tag `<old>` to `<new>` globally: every entry formerly tagged `<old>`
+reads `<new>` after the operation. FTS search re-syncs automatically via the
+existing `tags_au` trigger (DEC-016). No migration.
+
+- Exits 0 on success; stderr: `Renamed.`
+- Exits 1 (user error) if `<new>` already exists — directs the caller to
+  `brag tag merge` to combine two tags.
+- Exits 1 (user error) if `<old>` does not exist, if `<old> == <new>`, or if
+  the wrong number of arguments is given.
+- DB is unchanged on any error path (the operation is a single transaction).
+
+### `brag tag merge <src> <dst>` — merge one tag into another (STAGE-006)
+
+```
+brag tag merge auth authz
+```
+
+Folds `<src>`'s memberships into `<dst>`, de-duplicating: an entry tagged both
+`<src>` and `<dst>` ends with exactly one `<dst>` tagging. `<dst>`'s count rises
+by the previously-`src`-only memberships. The `<src>` tag row is deleted.
+Implemented via DELETE+INSERT on `taggings` (DEC-016 choice 3) so the existing
+`taggings_ai`/`taggings_ad` triggers keep `entries_fts` correct. No migration.
+
+- Both `<src>` and `<dst>` must exist (use `brag tag rename` to rename a tag
+  that doesn't conflict with any existing name).
+- Exits 0 on success; stderr: `Merged.`
+- Exits 1 (user error) if either `<src>` or `<dst>` does not exist, if
+  `<src> == <dst>`, or if the wrong number of arguments is given.
+- DB is unchanged on any error path (the operation is a single transaction).
+
+### `brag project new <name> --path <dir>` — register a project (STAGE-007)
+
+```
+brag project new bragfile --path ~/code/bragfile
+```
+
+Registers a new project named `<name>` with one initial filesystem location
+`<dir>`. The project starts with status `active` and an empty state note
+(use `brag project edit` to change them). `--path` is
+required and stored verbatim (path normalization is `brag project here`'s
+concern, STAGE-007).
+
+- Exits 0 on success; stderr: `Created project "<name>".` (stdout empty).
+- Exit 1 (user error) if `<name>` is empty, `--path` is missing/empty, the
+  name already exists, or the path is already registered to another project
+  (in which case nothing is created — the path is checked first).
+
+### `brag project ensure <name> [--location PATH]` — idempotent registration (STAGE-015)
+
+```
+brag project ensure standup
+brag project ensure standup --location ~/code/standup
+brag project ensure platform --location /srv/platform
+```
+
+Idempotently registers a project by name: creates it with status `active` if
+absent, and does nothing if it already exists. Unlike `brag project new`, ensure
+**never errors when the project already exists**, so it is safe to run before
+every capture or from an agent's setup script.
+
+- With `--location PATH`, the path is attached if it is not already registered;
+  re-attaching the same path to the same project is a no-op. A project may have
+  **multiple** locations. `--location` defaults to unset — no location (and no
+  current directory) is registered unless you pass it.
+- The name is trimmed and must be **64 characters or fewer** (matching the cap
+  `brag add --json` / MCP enforce on the `project` field, so an ensured name can
+  always soft-match a normally-added entry).
+- Exits 0 on both create and no-op. stdout empty. stderr carries composable
+  confirmations: a project line — `Created project "<name>".` or `Project
+  "<name>" already exists.` — and, only with `--location`, a location line —
+  `Attached location "<path>".` or `Location "<path>" already attached.`
+- Exit 1 (user error) if `<name>` is empty or over 64 characters, or if
+  `--location` names a path already registered to a **different** project (the
+  project is still ensured; only the location step fails — re-run after fixing
+  the path is safe).
+
+> **Two soft-link facts for consumers that map entries → projects/repos.**
+> (1) `brag project list` (and `brag project status`) read the `projects`
+> table, which is **authoritative but incomplete**: an entry's `project` is
+> free text (DEC-017) and MCP `brag_add` does not auto-fill it from cwd, so an
+> entry may reference a project name that was never registered. Use
+> `brag project ensure <name>` to register such a name. (2) A single project
+> may have **multiple** on-disk `locations`, so any mapping from an entry (or a
+> path) to a repo must handle a one-project-many-directories shape — see the
+> `locations` array in `brag project list --format json` / `brag project show
+> --format json`.
+
+### `brag project list` — list projects (STAGE-007)
+
+```
+brag project list                 # name<TAB>status<TAB>locations
+brag project list --format json   # naked JSON array of project objects
+```
+
+Lists every registered project, most-recently-updated first
+(`updated_at DESC, id DESC`), one per line as `<name>\t<status>\t<locations>`
+(locations comma-joined; `-` when none).
+
+- `--format json` — naked JSON array of project objects (DEC-011; 2-space
+  indent; `[]` on empty, never `null`). Object keys: `id, name, status,
+  state_note, locations, created_at, updated_at` (locations a JSON array of
+  strings; timestamps RFC3339).
+- Default (no `--format`) — plain tab-separated rows on stdout.
+- Unknown `--format` exits 1 (user error). stdout carries data; stderr empty.
+
+### `brag project show <name|id>` — show one project (STAGE-007)
+
+```
+brag project show bragfile
+brag project show 3 --format json
+```
+
+Shows one project's name, status, state note, and locations. The argument is
+resolved as a **name first**; if no project has that name and the argument is
+a positive integer, it is resolved as a project **id**. (No recent-brag count
+— that is `brag project status` (below).)
+
+- Plain output is a labeled block (`Name:`, `Status:`, `State note:`,
+  `Locations:`).
+- `--format json` — a single JSON object (not an array) with the same element
+  shape as `brag project list`.
+- Exit 1 (user error) if no project matches the name or id, or on unknown
+  `--format`.
+
+### `brag project status` — active-project dashboard (STAGE-007)
+
+```
+brag project status                 # name<TAB>status<TAB>count<TAB>state note
+brag project status --format json   # naked JSON array of status objects
+```
+
+Shows every **non-archived** project (status `active`, `paused`, or `done`),
+most-recently-updated first (`updated_at DESC, id DESC`), as a scannable
+dashboard. Each row carries the project name, status, a **brag count** (the
+number of entries whose `project` string equals the project name — the DEC-017
+soft string match, counted over all time), and the state note.
+
+- Plain output: tab-separated `<name>\t<status>\t<brag_count>\t<state_note>`
+  rows on stdout (a long state note is truncated; an empty note prints empty).
+- `--format json` — naked JSON array of status objects (DEC-011; 2-space
+  indent; `[]` on empty, never `null`). Object keys: `id, name, status,
+  state_note, brag_count, created_at, updated_at` (`brag_count` a number;
+  `state_note` carried in full, never truncated; timestamps RFC3339).
+- Default (no `--format`) — plain rows. Unknown `--format` exits 1 (user
+  error). stdout carries data; stderr empty.
+
+### `brag project here` — show the project for the current directory (STAGE-007)
+
+```
+brag project here
+brag project here --format json
+```
+
+Resolves `os.Getwd()` against registered project locations using
+nearest-ancestor (longest-prefix) matching (DEC-019): you may be anywhere
+inside a registered location's directory tree, not just at the exact root.
+When multiple registered paths are ancestors of the cwd, the most specific
+(longest) path wins.
+
+- Plain output (default): a single tab-separated line
+  `<name>\t<status>\t<state_note>` on stdout (`-` when state note is
+  empty); stderr empty; exit 0.
+- `--format json` — a single JSON object with the full project shape
+  (same as `brag project show --format json`; `locations` hydrated).
+- Not inside any registered project → stderr:
+  `not inside any registered project`, exit 1, stdout empty.
+- Unknown `--format` exits 1 (user error). No positional arguments;
+  reads `os.Getwd()` only.
+
+### `brag project edit <name|id>` — edit a project's fields (STAGE-007)
+
+```
+brag project edit bragfile --status paused
+brag project edit bragfile --state-note "shipped tags; next: cut v0.2.0"
+brag project edit bragfile --name brag-cli
+brag project edit bragfile --add-path ~/code/bragfile
+brag project edit bragfile --remove-path /srv/old-location
+```
+
+Edits a project's fields. The argument resolves as a **name first**, then as
+a positive-integer **id**. Pass at least one of `--name`, `--status`,
+`--state-note`, `--add-path`, or `--remove-path`; unspecified fields are
+unchanged.
+
+- `--name` — rename (must be unique). Renaming does **not** rewrite the project
+  string on existing brag entries (DEC-017); they keep their captured string.
+- `--status` — one of `active`, `paused`, `done`, `archived` (validated).
+- `--state-note` — the free-text state/next-action note.
+- `--add-path` / `--remove-path` (both repeatable) — attach/detach filesystem
+  locations. Paths match **verbatim** against what was registered.
+  `--remove-path` exits 1 if the path is not registered to this project or is
+  registered to a **different** project; `--add-path` exits 1 if the path is
+  already registered. All location changes in one invocation apply
+  **atomically** (removes before adds); a failure leaves locations unchanged.
+  Location edits do **not** change `updated_at` (DEC-020).
+- A scalar edit bumps `updated_at` (so the project rises in `brag project list`
+  recency order); a location-only edit does not.
+- Exits 0 on success; stderr: `Edited project "<name>".` (stdout empty).
+- Exit 1 (user error) if no flag is given, the project is not found, the new
+  name is already taken, `--status` is outside the enum, or a location operation
+  is rejected.
+
+### `brag project archive <name|id>` — archive a project (STAGE-007)
+
+```
+brag project archive bragfile
+```
+
+Sets a project's status to `archived` — a **non-destructive, recoverable**
+flip. The project, its state note, and its locations are all preserved. Restore
+it with `brag project edit <name|id> --status active`. This is **not** delete.
+
+- Exits 0 on success; stderr: `Archived project "<name>".` (stdout empty).
+- Exit 1 (user error) if the project is not found.
+
+### `brag project delete <name|id>` — permanently delete a project (STAGE-007)
+
+```
+brag project delete bragfile        # prompts y/N on stdin
+brag project delete bragfile --yes  # skip the prompt
+```
+
+Permanently removes a project and its `project_locations` rows. **Irreversible**
+(distinct from `archive`). Prompts for `y/N` confirmation on stderr unless
+`--yes`/`-y` is passed; a non-`y` answer prints `Aborted.` and exits 0 without
+deleting. Existing brag entries are **not** touched — an entry keeps its
+project string (DEC-017), so `brag list --project <name>` still finds those
+entries afterward (blast radius on entries: none — DEC-018).
+
+- `--yes`, `-y` — skip the confirmation prompt.
+- Exits 0 on success; stderr: `Deleted project "<name>".` (stdout empty).
+- Exit 1 (user error) if the project is not found.
+
+### `brag completion <shell>` — generate shell completion script (STAGE-005)
+
+```
+brag completion zsh|bash|fish
+```
+
+Writes a shell completion script to stdout. Supported shells: `zsh`, `bash`,
+`fish`.
+
+To source in the current session:
+
+- **zsh:** `source <(brag completion zsh)`
+- **bash:** `source <(brag completion bash)`
+- **fish:** `brag completion fish | source`
+
+For permanent setup, add the sourcing line to the shell's startup file
+(`~/.zshrc`, `~/.bashrc`, or `~/.config/fish/config.fish`).
+
+- Stdout on success: the completion script (pipe to `source` or redirect to a
+  file).
+- Stderr on success: empty.
+- Exit 0 on success; 1 if an unsupported shell name is given (user error); cobra
+  arg-count error if the shell arg is omitted.
+- No `--db` / `BRAGFILE_DB` dependency — completion generation is stateless.
+- PowerShell is not supported (bragfile distributes for macOS + Linux only).
+
+### `brag mcp serve` — local stdio MCP server (STAGE-009)
+
+```
+brag mcp serve
+```
+
+Runs a local, **stdio-only** Model Context Protocol (MCP) server (no network
+transport, no separate binary/install) exposing four typed tools over the
+same `~/.bragfile/db.sqlite` the CLI uses:
+
+- **`brag_add`** — `title` (required, non-empty, ≤200 chars), optional
+  `description` (≤100000), `tags` (≤64, comma-joined per DEC-004),
+  `project` (≤64), `type` (≤64), `impact` (≤256), plus `agent`/`model`
+  and the optional `session`/`cost`/`tokens` seed provenance params
+  (DEC-027). Inserts via `Store.Add` and returns the created entry
+  as a single [DEC-011](../decisions/DEC-011-json-output-shape.md) object.
+  A missing/empty `title` is a tool error, never a silent insert. Unlike
+  `brag add`, the MCP tool does **not** emit a SPEC-039 milestone line and
+  does **not** auto-fill `project` from a server-side cwd — the MCP server
+  has no meaningful cwd relative to the calling agent.
+- **`brag_list`** — filters `tag`/`project`/`type`/`limit` (exact match,
+  same semantics as `brag list`, minus `--since`); returns the DEC-011
+  array, byte-identical to `brag list --format json` on the same rows.
+- **`brag_search`** — `query` (required), `limit`; applies the same
+  [DEC-010](../decisions/DEC-010-search-query-syntax.md) whitespace-
+  tokenize + phrase-quote transform as `brag search` and returns the
+  DEC-011 array.
+- **`brag_stats`** — no arguments; returns the
+  [DEC-014](../decisions/DEC-014-rule-based-output-shape.md) envelope,
+  byte-identical to `brag stats --format json` for the same corpus.
+
+**Provenance.** `brag_add` stamps caller-provided `agent`/`model` as
+reserved-namespace tags — `agent:<name>` / `model:<id>` (lowercase,
+whitespace→`-`, commas stripped) — appended after the caller's own `tags`
+and canonicalized by the existing tags path
+([DEC-015](../decisions/DEC-015-tags-taggings-polymorphic-join.md)), with
+**no schema change**. `agent` falls back to the MCP client's
+`clientInfo.Name` when the param is omitted; `model` is **explicit-param
+only** (the MCP transport carries no model identity). Query provenance
+with the existing filters, e.g. `brag list --tag model:claude-opus-4-8`.
+
+**Seed provenance (DEC-027).** `brag_add` also accepts three optional
+seed params, stamped as reserved tags after `agent:`/`model:` in the order
+`session:` → `cost:` → `tokens:` — all optional (omit → no tag; bragfile
+never fabricates a value). `session:<id>` is an opaque per-session join-key
+(normalized like any reserved tag; the caller forwards the id the
+capture-nudge hook surfaces — the transport carries none). `cost:<n>` is a
+non-negative USD decimal string (e.g. `cost:0.42`); `tokens:<n>` is a
+non-negative integer (e.g. `tokens:18000`). A non-numeric or negative
+`cost`/`tokens` is a **tool error**, never a coerced tag. These are NOT
+author-provenance tags — `brag list --author` classification stays
+`agent:`/`model:`-only, so a `session:`/`cost:`/`tokens:`-only entry is
+`human`. No schema change (rides DEC-015); MCP-path-only (no `brag add`
+CLI flags).
+
+**Transport purity.** The stdio stream carries only MCP protocol frames on
+`os.Stdout`; nothing human-facing is ever printed there (the generalized
+form of `stdout-is-for-data-stderr-is-for-humans` at this transport). See
+[DEC-024](../decisions/DEC-024-mcp-server-sdk-transport-and-provenance.md).
+
+### `brag mcp install` — register the server in a client's config (STAGE-015)
+
+```
+brag mcp install [--client claude-code|claude-desktop|cursor] [--scope user|project] [--dir PATH] [--dry-run]
+```
+
+Writes or merges the `brag` MCP server block
+(`{"command":"brag","args":["mcp","serve"]}`) under `mcpServers` in the target
+client's config file, **idempotently** and **without clobbering** any other
+MCP server or unrelated top-level key. Re-running is always safe: a
+byte-identical result is detected and reported as a no-op (exit 0, no write).
+A present-but-different `brag` block is overwritten with the canonical block.
+
+**Flags** (defaults explicit):
+
+- `--client` (default `claude-code`) — one of `claude-code`,
+  `claude-desktop`, `cursor`.
+- `--scope` (default `project`) — `project` (the checked-in, shareable file)
+  or `user` (the per-user file).
+- `--dir` (default: current working directory) — the project directory for
+  `project` scope; a `UserError` if combined with `--scope user`.
+- `--dry-run` — prints the exact JSON that would be written to **stdout** and
+  a `Would write to <path>:` line to **stderr**, writing nothing to disk.
+
+**Target paths** (client × scope):
+
+| client         | scope   | path |
+|----------------|---------|------|
+| claude-code    | project | `<dir>/.mcp.json` |
+| claude-code    | user    | `~/.claude.json` |
+| cursor         | project | `<dir>/.cursor/mcp.json` |
+| cursor         | user    | `~/.cursor/mcp.json` |
+| claude-desktop | user    | macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`; Windows: `%APPDATA%\Claude\claude_desktop_config.json` |
+
+Unsupported combinations are `UserError`s (exit 1, stdout empty), never silent
+fallbacks: an unknown `--client` or `--scope`, `claude-desktop --scope
+project` (Desktop has no project config), `--dir` with `--scope user`, and
+`claude-desktop` on a non-macOS/non-Windows OS.
+
+**Output contract.** A real write prints `Registered brag MCP server in
+<path>` to stderr (stdout empty); a no-op prints `brag MCP server already
+registered in <path> (no changes)` to stderr (stdout empty). Only `--dry-run`
+emits data (the would-be JSON) on stdout. The command imports no storage and
+no SQL (`no-sql-in-cli-layer`). MCP servers connect at client startup —
+restart/reconnect the session after installing. See
+[DEC-034](../decisions/DEC-034-mcp-install-config-merge-scheme.md).
+
+## Error output
+
+All human-readable errors go to stderr with the prefix `brag: `. Example:
+
+```
+brag: no entry with id 42 (did you mean `brag list`?)
+```
+
+Machine-parseable output is stdout only; stderr is for humans.
+
+## Stability guarantees
+
+- **Pre-1.0:** command names and exit codes are stable within a minor
+  version; flag names may change between `v0.x` releases with CHANGELOG
+  notes.
+- **Post-1.0 (future):** no breaking changes to command names, flag
+  names, or exit codes without a major bump.
+
+## References
+
+- Architecture: [./architecture.md](./architecture.md)
+- Data model: [./data-model.md](./data-model.md)
+- `DEC-003` — config resolution order
+- `DEC-009` — editor buffer format (`brag edit <id>`)
+- `DEC-010` — `brag search` query syntax (auto-tokenize + phrase-quote)
+- `DEC-011` — shared JSON output shape for `brag list --format json` and `brag export --format json`
+- `DEC-013` — markdown export shape for `brag export --format markdown` (+`--flat`)
+- `DEC-012` — stdin-JSON schema for `brag add --json` (single object, title required, server-owned fields tolerated-and-ignored)
+- `DEC-014` — rule-based output shape for `brag summary`, `brag review`, `brag stats`, and `brag impact`: single-object JSON envelope with `generated_at` / `scope` / `filters` provenance + per-spec payload keys; markdown convention reuses DEC-013's provenance + summary-block style.
+- `DEC-016` — tag mutation semantics: `brag tags` in-use-only taxonomy (count-DESC/name-ASC; `{tag,count}` JSON shape), rename-errors-into-existing, merge via DELETE+INSERT, orphan tags invisible (no GC).
+- `DEC-017` — `entries.project` ↔ `projects` relationship (soft string match) + `projects.status` enum + single `state_note`; the data `brag project show`/`list` render.
+- `DEC-018` — `brag project delete` blast radius: entries untouched (soft match), project_locations deleted manually in-tx (FK off → no cascade), `'project'` taggings cleaned in-tx; archive is the recoverable status flip, delete is irreversible.
+- `DEC-019` — `brag project here` / `brag add` cwd auto-fill: nearest-ancestor (longest-prefix) match against registered project locations
+- `DEC-020` — `brag project edit` location editing: `RemoveLocation`/`EditLocations`; remove-not-attached and remove-other-project are user errors; verbatim path matching; one invocation's location changes are atomic (removes before adds); location edits don't bump `updated_at`.
+- `DEC-024` — `brag mcp serve`: official Go MCP SDK, stdio-only subcommand (not a separate binary), transport-purity generalization of the stdout/stderr spine, and provenance via reserved-namespace tags (explicit `agent`/`model` params with an `agent`/`clientInfo.Name` fallback).
+- `DEC-034` — `brag mcp install`: idempotent, no-clobber merge of the `brag` server block into a client's `mcpServers` config (claude-code/claude-desktop/cursor), per-client×scope target-path table, unsupported combos as `UserError`s, and the dry-run(JSON→stdout)/human(→stderr) output contract. Storage-free (`no-sql-in-cli-layer`).
+- `DEC-028` — `brag impact`: fourth DEC-014 consumer. CALENDAR time windows (`--quarter`/`--month`/`--year`, current in-progress period; `--since` via ParseSince) deliberately diverging from summary/review's rolling windows; initiative = the `project` axis (reuses `GroupEntriesByProject`); impact-first body (only entries with a non-empty `impact`, plus a `<shown>/<in-window>` tally); a narrow 4-key `{id,title,project,impact}` per-entry JSON projection.
+- `DEC-033` — `brag coverage`: sixth DEC-014 consumer. Provenance-share metric — per-month agent-vs-human split + share, an agent-share sparkline (DEC-031, markdown-only), and a self-reference density measure — over the shared DEC-028/DEC-032 calendar window. The classifier is single-sourced: a pure `aggregate.IsAgentAuthored` Go predicate kept in agreement with storage's `provenanceExistsClause` SQL clause by a cross-package drift-guard test (`brag list --author` stays SQL, unregressed).
+- `DEC-029` — `brag story --audience`: deterministic threads (initiative = the `project` axis, time-ordered, impact beats marked via `WithImpact`; an opt-in `--theme` cross-project cross-cut) + a throughline SKELETON that bragfile assembles and the caller's LLM weaves into an arc — the pure-pipe posture (no model/network in the binary) preserved. Audiences are DATA-DRIVEN shaping profiles (bundled `embed.FS` defaults + user override, override-wins, a flat `key: value` schema parsed by a hand-rolled stdlib parser — no new YAML dep), not a Go enum. The bundle EXTENDS DEC-014's envelope with an arc-aware body (`audience`/`threads`/`throughline`/`framing_directive`; a 7-key beat projection); framing directives ship as bundled per-audience assets, printable via `--print-directive`. Ships the gradient endpoints `me`/`exec` (`manager`/`skip` deferred to SPEC-050 as config-only).

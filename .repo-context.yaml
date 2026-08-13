@@ -1,0 +1,44 @@
+# .repo-context.yaml
+# Describes the APP (the repo itself). Persists across all projects run
+# against this app. Forward-compatible with ContextCore's ProjectContext CRD.
+#
+# Projects (waves of work against this app) live in ./projects/<id>/ and
+# each has its own brief.md.
+
+apiVersion: contextcore.io/v2
+kind: RepoContext
+
+metadata:
+  repo:
+    id: bragfile
+    name: "Bragfile"
+    purpose: "Local-first CLI for engineers to capture and retrieve career accomplishments for retros, reviews, and resumes."
+    url: "github.com/jysf/bragfile000"
+
+  business:
+    criticality: low                  # personal tool; no uptime obligation
+    owner: jysf
+    contacts:
+      - "jyashinsky@gmail.com"
+
+spec:
+  stack:
+    language: "go"
+    runtime: "go-1.26"                # latest stable as of project start (2026-04-19)
+    framework: "cobra"
+    database: "sqlite-3 (embedded, via modernc.org/sqlite — pure Go, no CGO)"
+    hosting: "local CLI; distributed via homebrew tap github.com/jysf/homebrew-bragfile"
+
+  # Standard paths; do not change without also updating AGENTS.md.
+  paths:
+    agents_md: ./AGENTS.md
+    docs: ./docs
+    guidance: ./guidance
+    decisions: ./decisions
+    projects: ./projects
+    templates: ./projects/_templates
+
+  observability:
+    sampling: null                    # n/a for a local CLI
+    alert_routing: null               # n/a
+    runbook_base: null                # n/a

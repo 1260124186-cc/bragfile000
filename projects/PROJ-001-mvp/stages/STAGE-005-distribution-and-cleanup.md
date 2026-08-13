@@ -1,0 +1,795 @@
+---
+# Maps to ContextCore epic-level conventions.
+# A Stage is a coherent chunk of work within a Project.
+# It has a spec backlog and ships as a unit when the backlog is done.
+
+stage:
+  id: STAGE-005                     # stable, zero-padded within the project
+  status: shipped                   # proposed | active | shipped | cancelled | on_hold
+  priority: medium                  # critical | high | medium | low
+  target_complete: 2026-04-30       # ~3–5 days from framing; outside boundary 2026-05-04 per brief
+
+project:
+  id: PROJ-001                      # parent project
+repo:
+  id: bragfile
+
+created_at: 2026-04-25
+shipped_at: 2026-05-11
+---
+
+# STAGE-005: Distribution and cleanup
+
+## What This Stage Is
+
+Make the feature-complete `brag` CLI **distributable** and **introducable**:
+when this stage ships, a stranger who lands on the repo via `brew install
+jysf/bragfile/bragfile` (or the GitHub URL) can install the binary, read a
+user-facing README that explains what `brag` does and how to use it, find
+a checked-in JSON-Schema contract for the AI-integration story, copy a
+working Claude Code session-end hook example, and wire shell-completion
+into their zsh/bash/fish session — all without ever needing to know the
+spec-driven development process the repo was built with. STAGE-001–004
+shipped the *tool*; STAGE-005 ships the *project's public surface*. After
+this stage ships, **PROJ-001 closes**.
+
+## Why Now
+
+Three reasons converge:
+
+1. **STAGE-004 shipped 2026-04-25** with the digest trio (`brag summary`,
+   `brag review`, `brag stats`) closing the feature surface for the
+   personal-workflow use case. There is no further feature work the brief
+   names; everything else has been triaged to backlog or to PROJ-002.
+   Distribution is the only remaining work between "I use this daily" and
+   "PROJ-001 is done."
+
+2. **The README documents the dev process, not the tool.** External Claude
+   review on 2026-04-24 surfaced what was already obvious in retrospect:
+   `README.md` opens with the spec-driven workflow and the
+   Repo→Project→Stage→Spec hierarchy, not with what `brag` does or how to
+   capture an entry. Anyone landing on the repo via a homebrew install
+   would be confused. The fix has to land *with* the homebrew install or
+   the install ships strangers into a misframed doc.
+
+3. **The user wants `brew install bragfile` for the learning value, not
+   for adoption.** The motivation is: practice the distribution mechanics
+   end-to-end (goreleaser + GitHub Actions + tap + CHANGELOG + completions)
+   on a real personal project. No marketing push. This framing matters
+   for scope discipline — we ship the mechanics correctly without
+   over-investing in adoption-ready polish (analytics, install metrics,
+   broad-platform support beyond darwin+linux × arm64+x86_64).
+
+No external blockers. The pre-stage chores landed 2026-04-25:
+`github.com/jysf/homebrew-bragfile` exists empty, AGENTS.md §10 has the
+push-discipline rule codified, and `just archive-spec` rejects empty
+`<answer>` placeholders. All 14 DECs apply forward unchanged; no new DECs
+expected this stage (distribution mechanics are configuration, not
+project-binding decisions).
+
+## Success Criteria
+
+- **`brew install jysf/bragfile/bragfile` works on macOS arm64.** From a
+  clean shell on a Mac without `brag` already on `$PATH`, the tap-install
+  flow produces a working `brag --version` and `brag add --title "x"` →
+  `brag list` round-trip against `~/.bragfile/db.sqlite`. Same flow on
+  darwin x86_64 if a test machine is available; linux arm64+x86_64 builds
+  produced and uploaded by goreleaser as a nice-to-have but not gate.
+- **README is user-facing.** Top-of-`README.md` answers "what is `brag`,
+  why would I use it, how do I install it, how do I capture my first
+  entry, where do entries live" within the first two scrolls — no mention
+  of cycles, stages, or specs above the fold. Spec-driven dev-process
+  content moved to `CONTRIBUTING.md` (or `docs/development.md` — SPEC-021
+  picks). Internal links audited; nothing broken.
+- **`docs/brag-entry.schema.json` exists and is referenced from BRAG.md.**
+  Schema mirrors DEC-012's stdin contract (required `title`; optional
+  `description, tags, project, type, impact`; server fields tolerated; no
+  unknown keys). BRAG.md cross-reference points at it as the validation
+  contract AI agents must produce against.
+- **Claude Code session-end hook artifacts ship.**
+  `scripts/claude-code-post-session.sh` is a working shell script that
+  consumes the JSON schema and proposes a `brag add --json` invocation;
+  the `/brag` slash command template is a markdown file under `examples/`
+  (or similar); a short install-instructions section in `BRAG.md` (or a
+  `scripts/README.md`) tells a user where to copy each artifact in
+  `~/.claude/`. **No new `brag` CLI surface** (artifacts not installers,
+  per Q3 framing answer).
+- **CI runs on every PR.** GitHub Actions workflow runs `go test ./...`,
+  `gofmt -l .` (fail on diff), and `go vet ./...` against the latest
+  stable Go on macOS-latest and ubuntu-latest. PR cannot merge red.
+- **Release on tag publishes binaries + auto-pushes formula to the tap.**
+  `git tag v0.1.0 && git push origin v0.1.0` triggers the release workflow,
+  goreleaser cross-compiles (darwin+linux × arm64+x86_64), uploads
+  archives to the GitHub release, generates release notes from
+  conventional-commit subjects, and pushes a `bragfile.rb` formula to
+  `github.com/jysf/homebrew-bragfile`. `CHANGELOG.md` populated with a
+  `[v0.1.0]` section.
+- **`brag completion zsh|bash|fish` writes a working completion script.**
+  Tab-completion works for `brag <tab>`, `brag add --<tab>`, `brag list
+  --<tab>` after sourcing the generated script in a shell rc.
+- All STAGE-001/002/003/004 success criteria still hold. `go test ./...`,
+  `gofmt -l .`, `go vet ./...`, `CGO_ENABLED=0 go build ./...` clean
+  through every spec.
+
+## Scope
+
+### In scope
+
+- **`README.md` user-facing rewrite** + spec-driven dev-process content
+  migrated to `CONTRIBUTING.md` (or `docs/development.md` — SPEC-021
+  picks). Internal-link audit; redirect-from-old-paths only if needed.
+  (SPEC-021)
+- **`docs/brag-entry.schema.json`** — JSON Schema (draft 2020-12 or
+  similar) mirroring DEC-012's stdin shape. BRAG.md cross-reference added
+  pointing at it as the validation contract. (SPEC-022)
+- **`scripts/claude-code-post-session.sh`** — shell script consuming the
+  schema; emits a candidate `brag add --json` payload at session end.
+  Plus a `/brag` slash command template (markdown under `examples/` or
+  `templates/`) and a short install-instructions section explaining how
+  to copy each artifact into `~/.claude/`. **Examples + docs only — no
+  new `brag` CLI surface.** (SPEC-022)
+- **`.goreleaser.yaml`** — cross-compile config (darwin+linux ×
+  arm64+x86_64), archive naming, release-notes hook, brews block pointing
+  at the tap repo. (SPEC-023)
+- **`.github/workflows/ci.yml`** — test + lint + vet on PR (matrix
+  macOS-latest + ubuntu-latest). (SPEC-023)
+- **`.github/workflows/release.yml`** — tag-triggered release;
+  cross-compiles, uploads to GitHub release, pushes formula to tap.
+  (SPEC-023)
+- **`CHANGELOG.md`** — Keep-A-Changelog style, retroactively populated
+  for v0.1.0 from PROJ-001's commit history. (SPEC-023)
+- **`brag completion zsh|bash|fish`** — cobra's built-in completion API,
+  exposed as a subcommand. Help text + smoke tests. (SPEC-024)
+- **Doc sweeps folded into originating specs** per the premise-audit
+  rule: `AGENTS.md §3` distribution mention may need an "arrived" tense
+  change post-SPEC-023 ship; `docs/tutorial.md` install section gets a
+  brew-install paragraph; `BRAG.md` adds the schema cross-reference.
+- **Blog-post draft** as an in-repo artifact (`docs/blog-spec-driven-bragfile.md`
+  or similar) — write-up of the spec-driven process applied to PROJ-001.
+  Artifact, **not a spec**. Publication target TBD post-draft (HN /
+  dev.to / Substack / personal site / GitHub Discussion); the in-repo
+  copy is canonical regardless.
+
+### Explicitly out of scope
+
+- **Marketing push.** No HN-front-page coordination, no Reddit posting
+  campaign, no Show-HN. The user wants `brew install bragfile` for the
+  learning value of shipping the mechanics correctly. Adoption is not a
+  success criterion.
+- **Pre-1.0 backward-compat promise** beyond what's already documented in
+  `docs/api-contract.md`. v0.x while the contract is plastic; v1.0 is a
+  separate decision after real usage at scale.
+- **New `brag` CLI surface for installing artifacts** (e.g.
+  `brag install-claude-hook`). Examples + docs only — copy-paste install
+  by the user. Per Q3 framing answer 2026-04-25.
+- **Tags-normalization migration** (e.g. moving from comma-joined string
+  per DEC-004 to a proper `entry_tags` join table). External Claude
+  review 2026-04-24 raised this as a v0.1-debt concern; user decision:
+  accept the debt, revisit if/when a concrete pain materializes.
+- **Soft-delete + edit-history.** Same shape as above — accepted v0.1
+  debt; revisit on concrete pain.
+- **Premise-audit sub-template extraction** flagged at SPEC-015 ship and
+  re-flagged at STAGE-004 ship. Deferred to **PROJ-002 framing** (where
+  feature work in the same shape returns) per Q5A framing answer
+  2026-04-25; STAGE-005 specs are mostly new-file work and the
+  extraction's value is concentrated in status-change work.
+- **Pulling from `backlog.md`.** STAGE-005's scope is distribution-shape,
+  not feature-shape; backlog items are feature-shaped and stay backlogged
+  for PROJ-002 or later projects.
+- **Linuxbrew, apt/yum packages, Windows support, Chocolatey.** Per brief
+  scope: macOS-first; linux falls out of goreleaser if it's free but is
+  not a success criterion.
+- **Anything that introduces a new top-level Go dependency** without an
+  accompanying DEC. (`no-new-top-level-deps-without-decision` constraint
+  applies forward unchanged.)
+- **LLM integration anywhere in the binary.** PROJ-002's reason for
+  existing.
+
+## Spec Backlog
+
+Ordered by recommended build sequence. SPEC-021 ships first because it's
+lowest risk, doesn't depend on other specs, and sets the user-facing
+framing the later specs reference. SPEC-022 + SPEC-023 are independent
+of each other and could run in parallel after SPEC-021 ships, but
+sequencing them serially is cleaner. SPEC-024 ships last because it's
+isolated and small.
+
+- [x] SPEC-021 (shipped 2026-04-25, **M**) — **README user-facing
+      rewrite + dev-process migration to `CONTRIBUTING.md` AND
+      `docs/development.md`.** README rewritten as user-facing
+      (install / capture / list / search / export / digests / where-
+      data-lives / where-to-go-next / license). New CONTRIBUTING.md
+      (thin GitHub-conventional pointer). New docs/development.md
+      (spec-driven framework details). New scripts/test-docs.sh
+      (40 grep-based shell asserts) exposed via new `just test-docs`
+      recipe (NOT wired into `just test`). Shipped via PR #21
+      (squash-merged `9abdeb6`). Clean cycle — 39/39 AC, 40/40
+      scripted asserts, 8/8 byte-identity checks; both watch-patterns
+      (§9 audit-grep cross-check + §12 NOT-contains self-audit)
+      no-op'd at build (second consecutive spec); §10 push-discipline
+      held on its first proactive application post-codification.
+      Two AGENTS.md addenda earned + codified at this ship: §9
+      BSD-grep `--exclude-dir` warning + §12 literal-artifact-as-spec
+      pattern (three confirming cases SPEC-018/020/021). Inherits
+      SPEC-023 punch list (deferred stale STAGE-NNN refs across
+      docs/api-contract.md / architecture.md / data-model.md /
+      tutorial.md:493).
+- [x] SPEC-022 (shipped 2026-04-26, **M**) — **AI-integration
+      distribution asset.** Three new artifacts shipped via the
+      §12 literal-artifact-as-spec pattern (third application,
+      first cross-format): `docs/brag-entry.schema.json` (50
+      lines, JSON Schema draft 2020-12 mirroring DEC-012);
+      `scripts/claude-code-post-session.sh` (67 lines, pure-stdin
+      bash hook with chmod +x); `examples/brag-slash-command.md`
+      (14 lines, tight slash-command template). Plus BRAG.md
+      insertion (50 lines, "## JSON contract for programmatic
+      capture" section) and scripts/test-docs.sh extension (161
+      lines, 23 new asserts in groups H/I/J/K). Shipped via
+      PR #22 (squash-merged `079bb89`). Clean cycle — 30/30 AC,
+      63/63 test-docs (40 SPEC-021 + 23 new), all 10 rejected-
+      alternatives held, no DEC. Cross-format literal-artifact
+      pattern validated (JSON + bash + markdown + in-place
+      markdown + shell extension all clean on first transcription
+      with zero drift). Both watch-patterns no-op'd at build for
+      the second consecutive spec; §10 push-discipline held on
+      its second proactive application; bfa1474 archive-spec
+      precondition exercised second time on a real ship and
+      passed. One Q3 cosmetic observation (BRAG.md HR-separator
+      asymmetry) WATCHED at N=1, not codified. STAGE-005 at
+      2/4.
+- [x] SPEC-023 (shipped 2026-05-10, **M**) — **Distribution
+      proper: goreleaser + GitHub Actions + CHANGELOG + tap-formula
+      auto-publish.** Shipped via PR #23 (squash-merged `d91e56b`)
+      + post-merge deprecation fix `1582572`. Four primary literal
+      artifacts (`.goreleaser.yaml` cross-compile darwin+linux ×
+      arm64+amd64; `ci.yml` test+gofmt+vet matrix; `release.yml`
+      tag-`v*` → goreleaser release → cask-push to
+      `github.com/jysf/homebrew-bragfile`; `CHANGELOG.md`
+      Keep-A-Changelog 1.1.0 with retroactive [0.1.0] section) +
+      three secondary literals (cmd/brag/main.go const→var
+      rewiring for ldflags injection, six-file doc sweep, 33-assert
+      test-docs.sh extension in groups L–P). §12 literal-artifact-
+      as-spec applied as fourth confirming application. Bundle-
+      vs-split decision documented at top of spec — KEPT BUNDLED.
+      Clean build cycle: 35/35 AC, three pre-tracked deviations
+      resolved at verify (L2 goreleaser version-line ordering; O4
+      CHANGELOG plain-verb form; D3 goreleaser deprecation
+      brews→homebrew_casks migration). End-to-end smoke verified:
+      v0.1.0-rc1 → v0.1.0 cut on 2026-05-11 with dual-tag-on-
+      same-commit gotcha caught and recovered (codified in
+      AGENTS.md §4); cask landed at `homebrew-bragfile/Casks/
+      bragfile.rb`; `brew install jysf/bragfile/bragfile` works
+      on macOS arm64 (Gatekeeper xattr workaround documented in
+      README §Install + AGENTS.md §4; notarization deferred to
+      backlog with full implementer checklist at
+      `docs/macos-notarization-checklist.md`).
+      **Stretched ship cycle** (2026-04-26 PR merge → 2026-05-11
+      Phase 2 close) due to user-requested security review pause
+      mid-ship: 280-line pre-distribution security review report
+      (`docs/reports/security/2026-04-26-pre-distribution-security-
+      review.md`) surfaced 3 medium + 5 low + ~13 info findings;
+      7 hardening fixes landed via PR #28 (`e443cf3`); CodeQL
+      first scan returned 0 alerts; GitHub Advanced Security
+      features (CodeQL, Dependabot security alerts + version
+      updates, secret scanning + push protection) enabled and
+      operational. Zero new DECs.
+- [x] SPEC-024 (shipped 2026-05-10, **S**) — **Shell completions.**
+      `brag completion zsh|bash|fish` subcommand wrapping cobra's
+      built-in completion API. Shipped via PR #32 (squash-merged
+      `3c9c912`). Seven literal artifacts (completion.go,
+      completion_test.go with 6 tests, cmd/brag/main.go 1-line
+      addition, tutorial.md §10 addendum, api-contract.md
+      `### brag completion` section, scripts/test-docs.sh groups
+      Q+R = +9 asserts → 116 total, CHANGELOG.md [Unreleased] entry).
+      PowerShell deliberately skipped per locked design decisions
+      (bragfile distributes darwin+linux only). §12(b) design-time
+      pre-flight against cobra v1.10.2 CAUGHT the bash-marker
+      assumption-vs-reality (stage Design Notes had
+      `_brag_completion()`; actual cobra emits `__start_brag` as
+      the registered entry point) — corrected at design, zero
+      deviations at build. **Cleanest spec cycle in the stage:**
+      14/14 AC, 116/116 test-docs, 0 build-time deviations, 5/5
+      CI green including CodeQL, all verify checks pass on first
+      run. Zero new DECs. §12 sub-rule (b) codified at this ship
+      (AGENTS.md update bundled in the ship commit) — D3 + §12(b)
+      forms the two-confirming-case codification.
+
+**Count:** 4 shipped / 0 active / 0 pending — **stage backlog
+fully shipped. Ready for stage close (Prompt 1d) and PROJ-001
+close (Prompt 1e, FIRST USE in this repo).**
+
+**Complexity check:** 1 × S/M + 2 × M + 1 × S; no L-complexity entries
+(none expected per framing prompt). Total ~4 specs, within the 3–5
+healthy-stage band. SPEC-023 is the load-bearing one — if any spec slips
+to L it's that one (goreleaser + two GHA workflows + CHANGELOG + tap
+integration is the heaviest workstream). Watch at SPEC-023 design;
+willing to split into "goreleaser + CI" + "release + tap + CHANGELOG"
+two-spec form if scope inspection at design time argues for it.
+
+## Design Notes
+
+Cross-cutting patterns and per-spec direction. AGENTS.md §9 lessons all
+apply unchanged (buffer split, tie-break, assertion specificity,
+locked-decisions-need-tests, premise-audit family, audit-grep
+cross-check, NOT-contains self-audit). §10 push-discipline rule codified
+2026-04-25 as a pre-stage chore. `just archive-spec` precondition for
+empty `<answer>` placeholders codified same day.
+
+### Cross-cutting
+
+- **No new DECs expected.** Distribution mechanics are configuration
+  choices, not project-binding decisions. If a spec at design time finds
+  a load-bearing choice that future projects in this repo will inherit
+  (e.g. "every release publishes to homebrew tap X by convention"), then
+  emit a DEC; otherwise document inline as a Locked Design Decision per
+  spec convention. Confidence-target check: a choice at <0.8 inside a
+  spec gets a question in `/guidance/questions.yaml` per AGENTS.md §14,
+  same as any other stage.
+
+- **Trim heuristic — STAGE-005 specs are heterogeneous, apply with care.**
+  STAGE-004 ship reflection codified (N=1, soft): "first spec in any new
+  stage keeps a fuller Notes-for-the-Implementer skeleton; specs 2+ can
+  compress to signatures + invariants only when the first spec's shape
+  is the construction precedent." STAGE-005's workstreams do **not**
+  share a uniform shape — SPEC-021 is prose-heavy, SPEC-022 is
+  shell+JSON+markdown, SPEC-023 is YAML+CI, SPEC-024 is Go-with-cobra.
+  Recommendation: SPEC-021 keeps a fuller skeleton; SPEC-022/023/024
+  apply trim only if their respective design sessions find construction
+  precedent inside the same spec or in a shipped neighbor. **Default to
+  fuller skeleton** if uncertain — the trim heuristic earned its keep on
+  same-shape sibling specs (SPEC-018→020), not across format-distinct
+  workstreams.
+
+- **Premise audit applicability is asymmetric across specs.** STAGE-005
+  is mostly new-file work (new YAML, new JSON, new shell script, new
+  CHANGELOG) where the audit-family rules — inversion-removal,
+  count-bump, status-change — don't have natural triggers. **The
+  exception is SPEC-021** (README rewrite) which IS a status-change at
+  scale: every doc that references the old README structure or
+  development-process placement needs a sweep. SPEC-021 design must
+  enumerate `grep -rn` patterns explicitly under `## Outputs` AND run
+  them at design time per the SPEC-018 audit-grep cross-check rule.
+  SPEC-022/023/024 will likely have minimal audit scope — design
+  sessions should still walk the rule but should expect "no hits, no
+  outputs" outcomes more often than not.
+
+- **Doc sweeps fold into originating specs** per the premise-audit rule.
+  Stage-level expected hot spots: `AGENTS.md §3` distribution mention
+  changes from "(arriving in STAGE-005)" to "shipped" tense post-SPEC-023;
+  `docs/tutorial.md` install section gets a brew-install paragraph
+  post-SPEC-023; `BRAG.md` cross-reference to the schema lands in
+  SPEC-022; the README itself is fully rewritten in SPEC-021.
+
+- **Blog post is an artifact, not a spec.** Lives at
+  `docs/blog-spec-driven-bragfile.md` (or similar — exact filename a
+  drafting decision) as the canonical source of truth. Versioned with
+  the project and reachable from `git log` if it informs future
+  framework refinements (likely). Publication target — HN, dev.to,
+  Substack, personal site, GitHub Discussion — is **independent and
+  TBD**, decided post-draft. Whichever spec the user chooses to draft
+  the post within (or as a separate non-spec session) leaves the
+  publication-target decision as a TODO in the artifact.
+
+- **Tap repo is pre-existing.** `github.com/jysf/homebrew-bragfile`
+  was created 2026-04-25 as a pre-stage chore (gh repo create + tap-repo
+  README pointing at the main repo). SPEC-023's PR is repo-local
+  goreleaser+GHA code only; no manual tap-repo bootstrap inside the
+  spec. The first tagged release auto-publishes the formula via
+  goreleaser's `brews:` block.
+
+- **CI test harness lessons all carry forward.** Per AGENTS.md §9:
+  separate `outBuf` / `errBuf` per command test; assert no
+  cross-leakage; line-based equality for any markdown heading-level
+  assertion; ID-based freshness checks (not timestamp-based);
+  fail-first run before implementation; every locked decision paired
+  with a failing test. SPEC-024 (`brag completion`) is the only spec
+  with new CLI surface this stage; the harness rules apply directly.
+  SPEC-021/022/023 mostly produce non-Go artifacts whose verification
+  may be golden-file or integration-style rather than unit-test —
+  per-spec design-session call.
+
+### SPEC-021-specific (`README` rewrite + dev-process migration)
+
+- **Above-the-fold of README answers user questions, not contributor
+  questions.** First scroll: name + tagline + status badge (if any) +
+  one-paragraph description. Second scroll: install (brew + source). 
+  Third scroll: first-entry capture + reading-back + where data lives.
+  Fourth scroll: links to tutorial, BRAG.md, full command reference. Move
+  the spec-driven workflow content (cycles, hierarchy, four-habits
+  discipline) to `CONTRIBUTING.md` (recommended over
+  `docs/development.md` — `CONTRIBUTING.md` is the GitHub-conventional
+  filename and surfaces in PR-create UI).
+- **Premise audit is the load-bearing concern.** `grep -rn "spec-driven"
+  README.md docs/ AGENTS.md` and `grep -rn "Repo.*Project.*Stage.*Spec"
+  README.md docs/ AGENTS.md` and `grep -rn "frame.*design.*build.*verify
+  .*ship" README.md docs/` to find every reference to the dev-process
+  framing. Each hit gets enumerated under `## Outputs` as either "stays
+  here" or "moves to CONTRIBUTING.md". Run the greps at design time per
+  audit-grep cross-check.
+- **`GETTING_STARTED.md`** at repo root is a contributor onboarding doc
+  (it walks through your first PROJECT, not your first brag entry). It
+  may need a sibling rewrite or a clarifying preamble — design call.
+- **`FIRST_SESSION_PROMPTS.md`** is purely for contributors / agents and
+  stays as-is.
+
+### SPEC-022-specific (JSON schema + Claude hook + slash command)
+
+- **JSON Schema source of truth.** Use draft 2020-12 (currently the
+  most-supported modern draft); `$id` pointing at the
+  `github.com/jysf/bragfile000/blob/main/docs/brag-entry.schema.json` URL.
+  Mirror DEC-012 exactly: `title` required + non-empty; `description,
+  tags, project, type, impact` optional strings; `id, created_at,
+  updated_at` permitted-but-ignored (`additionalProperties: false`
+  rejects unknowns to match the strict-reject rule).
+- **`brag add --json`'s actual implementation does not validate against
+  this schema.** The schema is documentation of the contract for
+  external consumers (AI agents, integrations); the binary's stdin
+  parser is the authoritative validator. **Failing test idea:** a
+  small Go test reads a fixture entry, passes it through `Store.Add`'s
+  JSON path, AND validates it against the checked-in schema (using
+  `gojsonschema` or similar) — proves the schema and the binary's
+  parser agree at one moment in time. Keeps the two from drifting
+  silently. Adding `gojsonschema` is a new top-level dep needing a
+  DEC; alternative is a Python or Node validation step in CI (no Go
+  dep change). Design call.
+- **Hook script artifacts:** `scripts/claude-code-post-session.sh` is a
+  bash script readable by a developer (well-commented, no obscure
+  jq incantations), reads transcript context, emits a candidate
+  `brag add --json` payload to stdout for the user to review. The
+  `/brag` slash-command template is a markdown file (likely under
+  `examples/` per convention) with the prompt that triggers Claude to
+  draft a brag entry from the current session. `BRAG.md` (or a new
+  `scripts/README.md`) explains where each artifact goes in
+  `~/.claude/`. **Confirm Claude Code's hook config + slash-command
+  paths at design time** — `~/.claude/settings.json` for hooks,
+  `~/.claude/commands/<name>.md` for slash commands as of late 2025;
+  re-verify against current docs.
+- **Cross-reference from BRAG.md** to the schema — natural fit in the
+  "Fields" section or a new "JSON contract" section.
+
+### SPEC-023-specific (goreleaser + GHA + CHANGELOG + tap auto-publish)
+
+- **Goreleaser config** is the heaviest piece. Cross-compile matrix:
+  darwin × {arm64, amd64}, linux × {arm64, amd64}. Archive format: tar.gz
+  with embedded LICENSE + README. Checksum file. Use goreleaser's
+  built-in changelog generator (group by conventional-commit type) for
+  release notes; CHANGELOG.md gets a v0.1.0 section retroactively from
+  PROJ-001's commit history at SPEC-023 design or build time (decision
+  call).
+- **`brews:` block** points at `github.com/jysf/homebrew-bragfile`. Needs
+  a GitHub token with `repo` scope on the tap repo — use a personal
+  access token stored as `HOMEBREW_TAP_GITHUB_TOKEN` repository secret;
+  the release workflow exposes it to goreleaser.
+- **CI workflow** runs on PR + push-to-main: `go test ./...`, `gofmt -l
+  .` (fail on diff), `go vet ./...`. Matrix: latest stable Go × {macos-latest,
+  ubuntu-latest}. Branch-protection update on `main` to require this
+  workflow as a green-check before merge — that's a manual GitHub UI
+  step, not in the workflow YAML; SPEC-023 ship checklist captures it.
+- **Release workflow** triggers on tag push matching `v*.*.*`. Runs
+  goreleaser; goreleaser handles cross-compile + GitHub release upload +
+  tap formula push.
+- **CHANGELOG.md** style: Keep-A-Changelog or a simpler conventional-commit
+  digest — design call. Retroactive v0.1.0 section pulls from PROJ-001's
+  commit history (`git log --oneline 902ed71` or similar — i.e. since the
+  STAGE-004 close).
+- **Smoke-test plan for ship checklist:** local `goreleaser build
+  --snapshot --clean` produces archives without uploading; one
+  end-to-end `git tag v0.1.0-rc1 && git push origin v0.1.0-rc1` against
+  a pre-release tag verifies the workflow before cutting v0.1.0 proper.
+
+### SPEC-024-specific (`brag completion zsh|bash|fish`)
+
+- **Cobra has built-in completion** generators (`Command.GenZshCompletion`
+  / `GenBashCompletion` / `GenFishCompletion`); the work is wiring them
+  to a `completion` subcommand with one positional arg
+  (`zsh|bash|fish|powershell` — possibly skip powershell unless trivial).
+- **Smoke-test pattern:** generate the script to a buffer, parse first
+  ~100 lines, assert presence of expected shell-specific markers (e.g.
+  `_brag_completion()` for bash, `#compdef brag` for zsh). Goldens are
+  brittle across cobra version bumps; presence-of-marker tests are
+  robust enough.
+- **Tutorial-section addendum** (post-ship doc sweep) shows how to source
+  the generated script in zsh/bash rc files.
+
+## Dependencies
+
+### Depends on
+
+- **STAGE-001 through STAGE-004 (all shipped)** — the entire feature
+  surface. README rewrite cites the digest commands; goreleaser packages
+  the binary that includes them; tutorial.md install section updates
+  reflect them.
+- **DEC-001 through DEC-014** — all apply forward unchanged. No new DECs
+  expected this stage.
+- **External: `github.com/jysf/homebrew-bragfile` tap repo.** Created
+  2026-04-25 as a pre-stage chore. SPEC-023's `brews:` block targets it.
+- **External: GitHub Actions secret `HOMEBREW_TAP_GITHUB_TOKEN`.** Will
+  be created during SPEC-023 build (manual UI step, captured in ship
+  checklist) — a personal access token with `repo` scope on the tap.
+- **External: `brew` installed on the user's macOS** for end-to-end
+  verification of the `brew install jysf/bragfile/bragfile` success
+  criterion.
+- **External (tooling): `goreleaser` available locally.** `brew install
+  goreleaser` per AGENTS.md §3 macOS note. CI installs via the
+  `goreleaser/goreleaser-action` GitHub Action.
+
+### Enables
+
+- **PROJ-001 closes** when STAGE-005 ships. This is the last stage of
+  the project per `brief.md`'s Stage Plan.
+- **PROJ-002 — AI assist (when opened).** A distributable bragfile binary
+  is what AI agents will integrate against; the JSON schema artifact is
+  the contract those agents validate against; the Claude hook example
+  is the in-the-wild reference implementation they pattern off.
+- **Future TUI / sync / cloud-backup projects.** All layer on a
+  distributable binary, not source builds. Shipping the homebrew tap
+  flow once means future projects can publish to the same tap without
+  re-litigating the mechanics.
+- **External adoption (if it ever becomes desired).** Not a goal of
+  PROJ-001 per brief, but the mechanics shipping correctly leaves the
+  door open without further work.
+
+## Stage-Level Reflection
+
+*Drafted via Prompt 1d (Stage Ship) in a fresh session on 2026-05-11.*
+
+### Success Criteria check
+
+The stage file enumerated seven success bullets at framing. All seven
+shipped; two carry operationally visible caveats that are documented
+upstream rather than carried as silent debt.
+
+- **`brew install jysf/bragfile/bragfile` works on macOS arm64.** ✅
+  Shipped via SPEC-023 (`d91e56b`) + v0.1.0 cut on 2026-05-11; cask
+  landed at `homebrew-bragfile/Casks/bragfile.rb`. **Caveat:** unsigned
+  binary triggers macOS Gatekeeper on first run; xattr workaround
+  documented in README §Install + AGENTS.md §4; full notarization
+  deferred to backlog with implementer checklist at
+  `docs/macos-notarization-checklist.md`.
+- **README is user-facing.** ✅ Shipped via SPEC-021 (PR #21, `9abdeb6`):
+  install/capture/list/export/digests/where-data-lives above the fold;
+  dev-process content moved to `CONTRIBUTING.md` (thin pointer) +
+  `docs/development.md` (framework details); 40-assert `test-docs.sh`
+  link-integrity harness ensured nothing broke.
+- **`docs/brag-entry.schema.json` exists and is referenced from BRAG.md.**
+  ✅ Shipped via SPEC-022 (PR #22, `079bb89`): 50-line JSON Schema draft
+  2020-12 mirroring DEC-012, plus a 50-line "## JSON contract for
+  programmatic capture" section in BRAG.md.
+- **Claude Code session-end hook artifacts ship.** ✅ Shipped via
+  SPEC-022: `scripts/claude-code-post-session.sh` (67-line pure-stdin
+  bash hook); `examples/brag-slash-command.md` (14-line slash-command
+  template, established the `examples/` directory convention); install
+  instructions co-located in BRAG.md. **No new `brag` CLI surface
+  introduced** (Q3 framing answer held).
+- **CI runs on every PR.** ✅ Shipped via SPEC-023:
+  `.github/workflows/ci.yml` runs `go test ./...`, `gofmt -l .`, and
+  `go vet ./...` on macos-latest + ubuntu-latest matrix; branch
+  protection on `main` requires this workflow as green-check
+  pre-merge.
+- **Release on tag publishes binaries + auto-pushes formula to the
+  tap.** ✅ Shipped via SPEC-023: `.goreleaser.yaml` cross-compiles
+  darwin+linux × arm64+amd64; `release.yml` triggers on `v*` tags;
+  `homebrew_casks:` block auto-pushes the cask formula to
+  `github.com/jysf/homebrew-bragfile`; `CHANGELOG.md` populated with a
+  retroactive `[0.1.0]` section. End-to-end smoke verified at v0.1.0-rc1
+  → v0.1.0 cut on 2026-05-11.
+- **`brag completion zsh|bash|fish` writes a working completion
+  script.** ✅ Shipped via SPEC-024 (PR #32, `3c9c912`): tab-completion
+  works after sourcing the generated script; PowerShell deliberately
+  skipped per locked design (bragfile distributes darwin+linux only).
+- **All STAGE-001..004 success criteria still hold.** ✅ `go test ./...`,
+  `gofmt -l .`, `go vet ./...` clean through every spec; v0.1.0 binary
+  exercises the full feature surface.
+
+### Three-sentence summary
+
+Built exactly the four specs framed at stage-open (SPEC-021/022/023/024)
+with no scope additions and no items deferred back to backlog mid-stage;
+v0.1.0 cut on the public homebrew tap on 2026-05-11. Speed was the
+slowest of any stage in PROJ-001 — 16 wall-clock days from framing to
+ship versus the framing-time outside boundary of 2026-05-04 (+6 days),
+driven primarily by a user-requested pre-distribution security-review
+pause inserted between SPEC-023 PR merge and ship (280-line review
+report, 7 hardening fixes via PR #28, GitHub Advanced Security feature
+enablement) plus a Phase 2 manual ship cycle that surfaced two
+operational frictions (goreleaser dual-tag-on-same-commit, macOS
+Gatekeeper on unsigned binaries). The emergent behaviour worth naming:
+SPEC-024 ran the cleanest cycle of PROJ-001 (zero deviations, 14/14
+AC, 116/116 test-docs assertions, all CI green on first push) because
+the new §12(b) design-time pre-flight against cobra v1.10.2 caught a
+bash-marker assumption mid-design that would otherwise have surfaced as
+a build/verify recovery — exactly the kind of payoff the codification
+predicts.
+
+### Reflection questions
+
+- **Did we deliver the outcome in "What This Stage Is"?** Yes. A
+  stranger who lands on the repo via `brew install
+  jysf/bragfile/bragfile` (or the GitHub URL) can install a working
+  binary, read a user-facing README, find a checked-in JSON-Schema
+  contract for AI integrations, copy a working Claude Code session-end
+  hook, and wire shell completion into zsh/bash/fish — all without
+  ever needing to know the spec-driven development process the repo
+  was built with. The two caveats are bounded and documented: macOS
+  Gatekeeper xattr workaround (xattr `com.apple.quarantine` removal,
+  one-time per install) and linux cross-builds shipped but not
+  smoke-tested on a real linux host (per framing: not a success
+  criterion). PROJ-001 is now ready to close.
+
+- **How many specs did it actually take?** 4 shipped / 4 framed —
+  exactly as planned. Complexity was 1 × M + 1 × M + 1 × M + 1 × S,
+  no L items, all four ship rows held their original complexity
+  estimate. SPEC-023's bundle-vs-split decision (flagged at framing
+  as a watch-for-split candidate — goreleaser + CI + release + tap +
+  CHANGELOG is a lot of surface for one spec) was documented at the
+  top of the spec and held: KEPT BUNDLED. The bundle decision survived
+  the stretched ship cycle without re-litigation, which is signal that
+  "one heavy spec is the right shape when the artifacts are
+  co-validating" — splitting would have produced two specs whose
+  separate end-to-end smoke tests would have needed re-running anyway.
+
+- **What changed between starting and shipping?** Two material shifts,
+  both insertions rather than pivots. (a) A user-requested security
+  review paused SPEC-023 ship between PR merge and Homebrew deploy
+  (mid-spec, 2026-04-26): produced a 280-line report at
+  `docs/reports/security/2026-04-26-pre-distribution-security-review.md`
+  (3 medium + 5 low + 13 info findings; zero critical/high), 7
+  hardening fixes via PR #28 (`e443cf3`), and enabled CodeQL +
+  Dependabot security alerts + Dependabot version updates + secret
+  scanning + push protection. (b) A Phase 2 manual ship cycle on
+  2026-05-11 surfaced two operational frictions — goreleaser
+  dual-tag-on-same-commit (v0.1.0 push picked `v0.1.0-rc1` as
+  `current=`, failed with `422 already_exists` on asset re-uploads;
+  recovery via `gh release delete v0.1.0-rc1 --cleanup-tag`) and
+  macOS Gatekeeper blocking unsigned binaries on first run after
+  `brew install`. Both frictions codified mid-stage into AGENTS.md §4
+  rather than carried as debt.
+
+- **Lessons that should update AGENTS.md, templates, or constraints?**
+  - **Already landed mid-stage (no further action needed):**
+    - AGENTS.md §4 dual-tag-on-same-commit recovery recipe (codified
+      2026-05-11 in `a15e36b`).
+    - AGENTS.md §4 macOS Gatekeeper unsigned-binary note + xattr
+      workaround (codified same commit).
+    - AGENTS.md §12 sub-rule (b) "design-time pre-flight: run
+      embedded literals through their target tools" — codified at
+      SPEC-024 ship (`17cf8e3`); two confirming cases (SPEC-023 D3
+      NEGATIVE — pre-flight skipped, deprecated goreleaser keys
+      surfaced at verify; SPEC-024 §12(b) POSITIVE — pre-flight done
+      against cobra v1.10.2, caught bash-marker assumption at design
+      with zero recovery cost) meets the project's "two opposing
+      outcomes on the same mechanical sub-rule" codification bar.
+  - **WATCH-list carry-forward (do NOT codify at this stage close):**
+    - **§12 sub-rule (a) "run embedded test assertions against
+      embedded literals at design time."** Two confirming cases, but
+      both within SPEC-023's lifecycle (L2 goreleaser version-line
+      ordering + O4 CHANGELOG plain-verb form). The mechanical shape
+      is identical to §12(b) — run the literal through its
+      mechanical checker before declaring design done — but a third
+      confirming case across a distinct spec is wanted before
+      codifying. Carry to PROJ-002 framing.
+    - **Trust-but-verify-agent-push-reports.** Two confirming cases
+      inside SPEC-023's ship lifecycle (punch-list fix + items 1-5
+      fix); a 2-second `git ls-remote origin <branch>` after any
+      agent reports "pushed" would have caught both before they cost
+      recovery cycles. Mechanically adjacent to §10's existing
+      push-discipline rule and §13's fresh-session discipline, but
+      addressed to the coordinator's verification reflex rather than
+      the implementer's process. Carry to PROJ-002 framing; a third
+      confirming case promotes it to §13.
+    - **§13 fresh-session-discipline for working-tree state.**
+      Single instance at SPEC-024 build cycle (working-tree edits
+      not visible to the coordinator's add+commit because a fresh
+      session lost the in-flight edits). N=1 only; not promotable.
+      Note here for future cross-reference.
+  - **Did NOT generalize as expected:** the STAGE-004 trim-when-
+    structural-analogy heuristic ("first spec keeps fuller skeleton;
+    siblings 2+ can trim when first sets the precedent") was carried
+    into STAGE-005 with the framing-time caveat that STAGE-005's
+    workstreams are heterogeneous (SPEC-021 prose, SPEC-022
+    multi-format, SPEC-023 YAML+CI, SPEC-024 Go+cobra). The caveat
+    held: no STAGE-005 spec compressed its Notes-for-the-Implementer
+    section by analogy to an in-stage sibling because no pair
+    shared a construction shape. The heuristic stays soft N=1 from
+    STAGE-004; PROJ-002's same-shape feature work is its next test.
+  - **Premise-audit sub-template extraction.** Flagged at SPEC-015
+    ship, re-flagged at STAGE-004 ship, deferred at STAGE-005 framing
+    on grounds that STAGE-005 specs are mostly new-file work where
+    the audit-family rules have minimal trigger surface. Confirmed
+    at stage close: SPEC-021 was the only stage spec with material
+    audit scope (status-change at scale across the doc set), and
+    its execution was clean. **Carry to PROJ-002 framing** — that is
+    the next project where same-shape feature work will repeat the
+    skeleton and the extraction's value concentrates.
+
+- **Should any spec-level reflections be promoted to stage-level
+  lessons?**
+  - **Yes (already promoted at the spec ship that earned it):** §12(b)
+    design-time pre-flight rule. SPEC-024 ship codified this into
+    AGENTS.md inline with the ship commit; no further action.
+  - **Yes (stage-level signal worth naming):** SPEC-022's reflection
+    captured that the §12 literal-artifact-as-spec pattern is
+    empirically **format-agnostic** — JSON Schema (50 lines) + bash
+    hook (67 lines) + markdown slash-command (14 lines) + in-place
+    markdown insertion (50 lines) + shell-script extension (155
+    lines) all transcribed and verified independently with zero
+    drift in one cycle. This is stronger evidence than any single
+    spec reflection conveys: the pattern's value compounds with
+    artifact count rather than degrading with format heterogeneity.
+    Directly applicable to PROJ-002 (any future `brag` integration
+    assets — webhook templates, IDE snippets, additional slash-
+    command templates — default to literal-artifact-embed when shape
+    is design-decidable).
+  - **No on everything else.** §9/§12/§4 addenda are already at
+    AGENTS.md scope.
+
+### Carry-forward
+
+- **To PROJ-002 (AI assist) framing:** a distributable binary is now
+  the integration target rather than a source build; the JSON schema
+  at `docs/brag-entry.schema.json` is the contract AI agents validate
+  against; the Claude Code session-end hook at
+  `scripts/claude-code-post-session.sh` is the reference
+  implementation new integrations pattern off. Premise-audit
+  sub-template extraction explicitly deferred to PROJ-002 framing
+  per stage scope. Two WATCH-list items (§12(a) literal-test
+  assertion pre-flight, trust-but-verify-agent-push-reports) need
+  third confirming cases from PROJ-002 specs before codification.
+- **To PROJ-001 close (Prompt 1e — first use in this repo):** blog-
+  post draft at `docs/blog-spec-driven-bragfile.md` (artifact, not a
+  spec; framing-time deliverable carried forward to project close);
+  cleanup of three persistent untracked files
+  (`framework-feedback/`, `revew1.md`, `status-after-nine-specs.md`)
+  — either commit, gitignore, or delete; the Project-Level
+  Reflection section in `brief.md`; verify any leftover Dependabot
+  major-version PRs are closed.
+- **Truly done:** every stage success criterion; every spec ship
+  cycle; v0.1.0 on the public homebrew tap; the
+  `2026-04-26-pre-distribution-security-review.md` report as a
+  durable artifact; the `docs/macos-notarization-checklist.md`
+  implementer guide for whenever notarization gets revisited.
+
+### Proposed AGENTS.md / templates / constraints edits at stage close
+
+**No new inline codifications proposed at this stage close.** Every
+codify-worthy lesson earned during STAGE-005 was codified at the spec
+ship that surfaced it (§4 dual-tag in `a15e36b`; §4 Gatekeeper in
+`a15e36b`; §12(b) pre-flight in `17cf8e3`). The remaining patterns
+are explicitly on the WATCH list with documented third-case triggers
+for PROJ-002 — codifying at N=2-within-one-spec would over-fit. The
+STAGE-004 trim-when-structural-analogy heuristic stays at soft N=1
+per its framing-time caveat.
+
+**One small templates note** (not blocking, captured here for the
+coordinator's PROJ-001-close commit consideration): the stage scope
+section explicitly invokes "doc sweeps fold into originating specs"
+as a stage-wide rule; SPEC-023's stretched cycle confirmed this rule
+works under non-trivial conditions (the doc sweep landed as a
+secondary literal artifact inside SPEC-023 itself rather than as a
+separate cleanup spec). Worth a one-line strengthening in the stage
+template if a future iteration touches it: "doc sweeps fold into
+originating specs even when the originating spec is heavy" — but
+not load-bearing enough to warrant a templates change as part of
+this stage close.
+
+### Stage summary
+
+STAGE-005 delivered the four-spec backlog cleanly but on a stretched
+timeline (16 days vs. 2-week intent; +6 days past the framing-time
+outside boundary), driven by two insertions rather than pivots: a
+user-requested pre-distribution security review and a Phase 2 manual
+ship cycle that surfaced two operational gotchas. Both insertions
+produced durable artifacts — the 280-line security report, PR #28's
+hardening fixes, GitHub Advanced Security feature enablement, and two
+AGENTS.md §4 operational addenda — rather than silent debt or
+follow-up spec sprawl. The cleanest evidence the framework matured
+mid-stage: SPEC-024 ran with zero deviations at build, 116/116
+test-docs green on first run, all CI green on first push, because
+§12(b) design-time pre-flight against cobra v1.10.2 caught a
+bash-marker assumption at the cheapest possible moment. The
+codification bar was met by two opposing-outcome cases (SPEC-023 D3
+NEGATIVE, SPEC-024 §12(b) POSITIVE) on the same mechanical sub-rule,
+which is the pattern STAGE-005 most clearly demonstrates: process
+lessons that produce both a costly miss and a cheap save earn their
+codification with two cases, not three. PROJ-001 closes next via
+Prompt 1e.

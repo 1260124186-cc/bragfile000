@@ -1,0 +1,493 @@
+# guidance/questions.yaml
+# Open questions under active investigation. Agents can see what we're
+# still figuring out and avoid re-deriving answers in isolation.
+#
+# Every question MUST have:
+#   - id: stable kebab-case identifier
+#   - question: the question in one sentence
+#   - priority: critical | high | medium | low
+#   - status: open | investigating | answered
+#   - raised_by: human | claude | <agent-id>
+#   - raised_at: YYYY-MM-DD
+#   - assigned_to: null | <agent-id> | <human>
+#
+# When a question is answered, either:
+#   (a) update status to "answered" and link to the DEC-XXX that records the answer, or
+#   (b) delete the question if it was resolved without a formal decision.
+
+questions:
+  - id: spark-month-semantic-drift
+    question: "Does brag spark's rolling --month (28 days) reading misleadingly, given --month means rolling 30 days in brag review and the calendar month in impact/coverage/wrapped?"
+    priority: low
+    status: open
+    raised_by: claude-opus-4-8
+    raised_at: 2026-07-10
+    assigned_to: null
+    notes: |
+      Filed at SPEC-059 design (DEC-037, confidence 0.72). DEC-037 chose ROLLING
+      windows for the pulse (a pulse is "now"), with --week=7d/7 daily bars,
+      --month=28d/4 weekly bars, --quarter=91d/13 weekly bars. 28 (not 30) days
+      is required to get four clean weekly buckets. The consequence is that
+      --month now means THREE different spans across the CLI: rolling 28d here,
+      rolling 30d in `brag review`, and the calendar month in
+      impact/coverage/wrapped. This is a real cross-surface ergonomic wart, not a
+      correctness issue — the `scope` echo + the `Generated:` line make the actual
+      window unambiguous in output, and the choice is reversible.
+
+      Resolve/harden when `brag spark` is dogfooded over the real corpus: if the
+      rolling-`--month` span reads misleadingly against the other commands'
+      `--month`, revisit by either renaming spark's flags to be span-explicit
+      (e.g. --7d/--28d/--91d) or unifying `--month` semantics CLI-wide. Both are
+      localized flag-surface changes — the RollingBuckets primitive and the
+      DEC-014 envelope are unaffected either way. Weekly-review should watch this
+      as the canonical "same flag, different meaning per command" inconsistency.
+
+  - id: coverage-sparkline-metric-choice
+    question: "Should brag coverage's monthly trend sparkline encode agent SHARE (share×100, the adoption trend) or agent COUNT (volume) — and does the single-entry-month = 100% spike read misleadingly in practice?"
+    priority: medium
+    status: answered
+    raised_by: claude-opus-4-8
+    raised_at: 2026-07-07
+    assigned_to: null
+    answered_by: SPEC-045 build (2026-07-07), per orchestrator sign-off — DEC-033
+    notes: |
+      RESOLVED to agent SHARE (share×100, min→max normalized via spark.Line),
+      per the DEC-033 sign-off, and SHIPPED that way in SPEC-045 build. The
+      command's thesis is agent-native ADOPTION over time, not entry volume, so
+      the share is the honest series; the raw per-month agent/human counts are
+      printed directly beneath the glyph line, which disambiguates any
+      flat/ambiguous stretch. The residual single-entry-month = 100% soft spot
+      (below) is parked for a post-v0.4.0 dogfooding re-check — no wire change is
+      needed to re-render the trend differently, since the JSON already carries
+      raw counts + shares.
+
+      The residual soft spot: a month with a single entry that happens to be
+      agent-authored renders 100% (a full-height glyph), which can OVERSTATE
+      adoption relative to a busier, more representative month. The adjacent raw
+      counts mitigate this, but a reader scanning only the glyphs could be misled.
+
+      Resolve/harden when coverage is dogfooded over the real post-v0.4.0 corpus:
+      if the single-entry-month spike (or a share-vs-count preference) reads
+      misleadingly, revisit with a count-weighted or dual-series sparkline, or a
+      minimum-entries-per-bucket threshold. All are localized, additive changes —
+      the CoverageBucket shape and the DEC-014 envelope are unaffected either way
+      (JSON already carries raw counts + shares, so no wire change is needed to
+      re-render the trend differently).
+
+  - id: tags-storage-model
+    question: "Is comma-joined TEXT still the right shape for tags once `list --tag` and FTS5 `search` are implemented, or do we need to migrate to a normalized tags/entry_tags pair?"
+    priority: medium
+    status: answered
+    raised_by: claude
+    raised_at: 2026-04-19
+    assigned_to: null
+    answered_by: SPEC-007 (2026-04-20)
+    notes: |
+      DEC-004 picked comma-joined TEXT at confidence 0.65 for MVP. The
+      risk is (1) the "auth" matching "authoring" false-positive unless
+      LIKE is wrapped with sentinel commas, and (2) FTS5 tokenization
+      may produce odd search behavior on comma-separated terms.
+      Revisit during STAGE-002 when `list --tag` and `search` ship.
+      If either of those specs needs more than ~20 extra lines of code
+      to get right with comma-joined tags, that's the signal to
+      normalize.
+
+      Answered by SPEC-007 (2026-04-20): the sentinel-comma LIKE
+      pattern (`',' || tags || ',' LIKE '%,<tag>,%'`) resolves concern
+      (1) in a single SQL line with no normalization and no new
+      migration. A regression test (`TestList_TagFilterNoFalsePositive`)
+      pins the `"auth"` vs `"authoring"` case. DEC-004's Validation
+      section now references SPEC-007. Concern (2) re-opens if/when
+      FTS5 lands in SPEC-011 — kept this question for the record,
+      but the MVP-scale answer is "comma-joined stays".
+
+  - id: tag-ordering-projection
+    question: "Should the reconstructed Entry.Tags projection preserve each entry's original tag order (via the taggings.position column) or is name-ASC sufficient — i.e. can we drop the position column?"
+    priority: low
+    status: open
+    raised_by: claude
+    raised_at: 2026-06-06
+    assigned_to: null
+    notes: |
+      DEC-015 (SPEC-025) reconstructs Entry.Tags via
+      GROUP_CONCAT(tags.name, ',' ORDER BY taggings.position). The
+      `position` column was added so a canonical-but-unsorted input
+      ("perf,auth") round-trips byte-identically instead of being
+      sorted to "auth,perf". This is the only DEC-015 sub-choice below
+      0.8 confidence (~0.75).
+
+      The catch: every tag string that currently round-trips through the
+      Store in the test corpus (and, as far as we can tell, in practice)
+      is already alphabetically ordered, so `name ASC` ordering with NO
+      position column would pass every existing test today. `position`
+      is therefore insurance whose value is not yet observable.
+
+      Revisit trigger: if, by the end of PROJ-002 (or first real v0.2.x
+      dogfooding), no consumer depends on per-entry tag order AND no
+      production entry is observed with unsorted tags, drop the
+      `position` column in a follow-up migration and switch the
+      projection to `ORDER BY tags.name`. Until then, keep `position` —
+      it is the byte-faithful choice for "lossless and invisible."
+
+  - id: tag-rename-into-existing
+    question: "Should `brag tag rename <old> <new>` error when `<new>` already exists (forcing the user to `merge`), or silently auto-merge `<old>` into `<new>`?"
+    priority: low
+    status: open
+    raised_by: claude
+    raised_at: 2026-06-07
+    assigned_to: null
+    notes: |
+      DEC-016 (SPEC-026) choice 2 locks **error, not auto-merge**:
+      rename is a pure single-statement UPDATE; when `<new>` collides
+      with the `tags.name` UNIQUE constraint, rename returns a user
+      error pointing at `brag tag merge`. Rationale: principle of least
+      surprise — a command named "rename" should not silently delete a
+      second tag and re-point its memberships. Keeps rename/merge
+      orthogonal (rename = "misnamed"; merge = "same concept, combine").
+
+      This is the softest DEC-016 sub-choice (~0.8). The defensible
+      alternative is "do what I mean": treat rename-into-existing as an
+      implicit merge. It is the choice most likely to attract a real
+      user request once v0.2.x is dogfooded.
+
+      Revisit trigger: if a user reports that rename-into-existing
+      *should* just merge (or finds the two-step rename→error→merge
+      annoying in practice), reconsider — the change is small (route
+      RenameTag's ErrTagExists path into MergeTags) but it is a contract
+      change and would amend DEC-016 choice 2.
+
+  - id: shareable-ids
+    question: "Will we ever need IDs that are portable across machines (sync, sharing, export-import), and if so when do we add a ULID column alongside the integer PK?"
+    priority: low
+    status: open
+    raised_by: claude
+    raised_at: 2026-04-19
+    assigned_to: null
+    notes: |
+      DEC-005 picked INTEGER AUTOINCREMENT at confidence 0.70. Revisit
+      if and when sync or cross-machine export enters scope (earliest
+      in a post-MVP project). The migration path is additive: add a
+      `ulid TEXT UNIQUE` column, backfill, switch user-facing CLI to
+      accept either form. No data loss.
+
+  - id: editor-template-format
+    question: "What exact format does the editor-launch markdown buffer use — YAML front-matter plus a body, or a simpler key-value header?"
+    priority: medium
+    status: open
+    raised_by: claude
+    raised_at: 2026-04-19
+    assigned_to: null
+    notes: |
+      Arrives in STAGE-002 (SPEC for `brag edit` / `brag add` no-args).
+      Leading candidate: YAML front-matter for optional fields (tags,
+      project, type, impact), then `# <title>` and the description as
+      the body. Decide before writing the spec, as it affects parser
+      choice and round-trip of existing entries for `edit`.
+
+  - id: summary-grouping-heuristics
+    question: "How does `brag summary --range week` decide on grouping order (project first vs type first vs tag first) when an entry has all three?"
+    priority: low
+    status: open
+    raised_by: claude
+    raised_at: 2026-04-19
+    assigned_to: null
+    notes: |
+      Lands in STAGE-003. Leaning toward: always group by `project`
+      first, then `type` second, with tags shown inline per entry.
+      Make this choice when writing the summary spec — not now.
+
+  - id: project-state-note-shape
+    question: "Should a project's state/next-action note stay a single free-text `state_note` column, or split into structured `state` + `next_action` fields?"
+    priority: medium
+    status: answered
+    raised_by: claude
+    raised_at: 2026-06-08
+    assigned_to: null
+    answered_by: SPEC-030 (2026-06-09)
+    notes: |
+      Filed at SPEC-027 design (DEC-017, confidence 0.80 composite; this
+      sub-choice ~0.78, the one piece below 0.8). DEC-017 locks a single
+      free-text `state_note TEXT NOT NULL DEFAULT ''` column in the
+      `0004_add_projects` migration as the minimal primitive — the user
+      writes "Shipped tags; next: cut v0.2.0" freely. Resolve at SPEC-030
+      design (the `brag project status` dashboard) BEFORE the dashboard
+      renders the note: if the dashboard wants to surface "next action"
+      distinctly from "state," a split is warranted. Under forward-only
+      migrations (DEC-002) splitting later is an additive column +
+      one-shot copy, not a rebuild — so deferring is cheap and YAGNI
+      favors holding the single column until a renderer needs structure.
+
+      Answered by SPEC-030 (2026-06-09), LD3: **keep single free-text
+      column.** The dashboard — the named consumer that was meant to force
+      this question — renders the note fine as a single column: truncated
+      to 50 runes + "…" in the plain tab-separated row, carried in full in
+      the `--format json` output. A one-row-per-project dashboard needs
+      *less* structure than `brag project show` (which already renders the
+      note as one labeled `State note:` line and reads fine), not more;
+      splitting into `state` + `next_action` would either cram two columns
+      into a terminal row or be re-concatenated for display (defeating the
+      split). No `0005` migration, no DEC amendment — DEC-017 already
+      records the single-column choice and this confirms it. Revisit
+      trigger unchanged: if a future renderer genuinely needs to surface
+      "next action" distinctly, it is a cheap additive column + one-shot
+      copy superseding DEC-017's note sub-choice.
+
+  - id: impact-window-calendar-vs-rolling
+    question: "Should `brag impact --quarter|--month|--year` use calendar periods (current in-progress quarter/month/year) or rolling windows (now - 90/30/365 days) like `brag summary`?"
+    priority: medium
+    status: resolved
+    raised_by: claude
+    raised_at: 2026-07-06
+    resolved_at: 2026-07-06
+    resolved_by: orchestrator + user sign-off
+    resolution: |
+      CALENDAR periods, current-in-progress-period-to-date. Confirmed at
+      SPEC-048 build by orchestrator sign-off, validated by the user
+      (companies report by calendar quarter). `--quarter`/`--month`/`--year`
+      compute the period start via `time.Date` constructors (never day
+      subtraction), `--since` reuses DEC-008 `ParseSince`. The load-bearing
+      divergence is enforced by TestImpactCmd_CalendarNotRolling (the
+      quarter-start entry is IN, the day-before is OUT — which fails under a
+      rolling now-90d reading). A `--previous` (last-completed-period)
+      modifier is explicitly deferred to FUTURE scope, NOT implemented now,
+      and the design does not foreclose it. Revisit only if STAGE-012's
+      `brag story --audience` needs a trailing-window reading for some
+      audience — add a rolling modifier then rather than flip the default.
+    assigned_to: null
+    notes: |
+      Filed at SPEC-048 design (DEC-028, confidence 0.78 composite; this
+      window-semantics sub-choice is the piece below 0.8 that drags the
+      average — the envelope-inheritance sub-choices are 0.85-0.9). DEC-028
+      locks CALENDAR periods, deliberately diverging from DEC-014 choice (6)
+      which locks ROLLING windows for `brag summary`/`review`. Rationale:
+      `brag impact` feeds the v0.4.0 story surface (STAGE-012 `brag story
+      --audience`), whose audiences (manager/skip/exec) think in reporting
+      periods — "what did you ship this quarter?" means the calendar
+      quarter, not a trailing 90 days. Rolling is defensible and simpler;
+      a user could reasonably expect either. Resolve/confirm when STAGE-012
+      wires the story surface onto this digest: if `brag story` needs the
+      trailing-window reading for any audience, revisit (add a rolling
+      modifier rather than flip the default). Second, related soft spot:
+      DEC-028 chose the CURRENT in-progress period (up to now), not the
+      previous COMPLETE one; a `--previous` modifier is the clean future
+      addition if the complete-period workflow materializes. Neither
+      changes the schema — both are flag/semantics-only.
+
+  - id: story-profile-override-file-format
+    question: "What is the exact file format, config path, and precedence for user-defined `brag story` audience shaping profiles (the override layer over the bundled defaults)?"
+    priority: medium
+    status: resolved
+    raised_by: claude
+    raised_at: 2026-07-06
+    resolved_at: 2026-07-06
+    resolved_by: orchestrator sign-off (SPEC-049 build)
+    assigned_to: null
+    resolution: |
+      LOCKED at SPEC-049 build by orchestrator sign-off. (a) Format: a
+      flat `key: value` file with no nesting/lists, parsed by a hand-rolled
+      stdlib `bufio` parser (≈30 lines) — NO new YAML dependency
+      (`no-new-top-level-deps-without-decision` kept clean; go.mod carries
+      no YAML dep). Keys: name, default_window, impact_threads_only,
+      drop_impactless_beats, fold_small_threads, thread_order, candor,
+      directive. Unknown keys and non-boolean booleans are errors (typo
+      protection). (b) Path: `~/.bragfile/story-profiles/<name>.yaml`,
+      resolved through an injectable package-var seam (`story.overrideDir`)
+      for tests. (c) Precedence: OVERRIDE-WINS by name — a user
+      `<name>.yaml` fully shadows the bundled default of the same name (no
+      field-merge). (d) Malformed handling: REJECT with an error naming the
+      file — NO silent fallback to the bundled default (AC-9). Paired
+      tests: TestLoadProfile_BundledDefaults / _UserOverrideShadowsBundled
+      / _UnknownAndMalformed (all green). The override path stays lightly
+      exercised until a genuine third-party profile appears (SPEC-050's
+      manager/skip ship as bundled defaults, not user-override files);
+      revisit the merge-vs-replace + nested-config question only if a real
+      profile needs nested/list config, which then requires a DEC for a
+      YAML dep. The extension file suffix stays `.yaml` even though the
+      parser is a subset — a real YAML file with only flat keys parses
+      identically, so upgrading to a YAML engine later is non-breaking.
+    notes: |
+      Filed at SPEC-049 design (DEC-029, composite confidence 0.72). The
+      profiles-as-DATA *mechanism* is high-confidence and locked (DEC-029
+      choice 2): a profile = selection filter + threading policy +
+      altitude/length + framing-directive pointer, sourced from a bundled
+      default asset (embed.FS) with an optional user override. What is
+      below 0.8 is the *concrete surface*: (a) the override file format —
+      YAML is the lean; JSON/TOML are alternatives; (b) the path —
+      `~/.bragfile/story-profiles/<name>.yaml` vs a `config`-dir location
+      vs a single `story-profiles.yaml` map file; (c) precedence when a
+      user file shadows a bundled default name (override-wins vs
+      merge-fields); (d) malformed/partial-profile handling (reject vs
+      fall back to default vs merge). SPEC-049 SHIPS the bundled `me`/`exec`
+      defaults and the loader that reads them; it specifies the override
+      path + format + precedence as a locked design decision so build does
+      not guess, but the surface is new (no prior config-file-as-data
+      precedent in the repo beyond flags + embedded migrations), hence the
+      confidence flag. Resolve/harden when the first real user profile is
+      authored (SPEC-050 `manager`/`skip` are shipped-as-bundled-defaults,
+      NOT user-override files, so they exercise the loader but not the
+      override precedence — the override path stays lightly exercised until
+      a genuine third-party profile appears).
+
+  - id: story-two-audience-slice-proves-divergence
+    question: "Do the two shipped audiences (`me`, `exec`) prove `brag story`'s 'same in theory, diverge in practice' thesis convincingly, or does the release need `manager` too to be persuasive?"
+    priority: medium
+    status: resolved
+    raised_by: claude
+    raised_at: 2026-07-06
+    resolved_at: 2026-07-06
+    resolved_by: orchestrator sign-off (SPEC-049 build)
+    assigned_to: null
+    resolution: |
+      RESOLVED at SPEC-049 build by orchestrator sign-off: ship the
+      gradient ENDPOINTS `me` and `exec` now; the middle (`manager`/`skip`)
+      lands in SPEC-050 as config-only bundled defaults (the zero-Go-change
+      extensibility proof). The endpoints prove the thesis convincingly —
+      the live me-vs-exec run over the SAME corpus produces demonstrably
+      different bundles by RULE, not tone: `me` = 4 threads / Beats 6/6 /
+      impact-less beats + the (no project) thread KEPT / alpha-ASC order;
+      `exec` = 3 threads / Beats 4/6 / impact-less beats DROPPED + the
+      (no project) thread FOLDED / impact-beat-count-DESC order (beta
+      leads). That divergence lives in the deterministic body (threads,
+      beats, throughline), not only the framing directive, and is locked by
+      byte-exact goldens (Tests 1/2/3) + the live-DB assertion (Test 15).
+      The mechanism is data-driven, so pulling `manager` forward would have
+      been additive config with zero mechanism change — deferring it does
+      not weaken the headline. `manager` in SPEC-050 then demonstrates the
+      extensibility claim explicitly (adding an audience touches no Go).
+    notes: |
+      Filed at SPEC-049 design (DEC-029 choice 4). SPEC-049 ships the
+      gradient ENDPOINTS — `me` (candid / every thread / impact-less beats
+      kept / low altitude / many arcs) and `exec` (promotional / impact-
+      bearing threads only / small threads folded / impact-less beats
+      dropped / high altitude / one headline arc) — because the endpoints
+      maximally exercise the mechanism and give the sharpest byte-golden
+      contrast. The open question is whether shipping only the endpoints
+      reads as "we built two hard-coded modes" rather than "we built an
+      extensible gradient." Mitigations already in the design: (1) the
+      mechanism is data-driven, so `manager` is a config-only addition;
+      (2) SPEC-050 adds `manager`/`skip` explicitly to DEMONSTRATE the
+      zero-Go-change extensibility. If the orchestrator judges two
+      endpoints insufficient for the v0.4.0 narrative headline, pull
+      `manager` forward into SPEC-049 (it is additive config; it does not
+      change the mechanism or the bundle shape). Recorded so the
+      slice-vs-whole call is explicit, not silent.
+
+  - id: wrapped-default-current-vs-last-completed
+    question: "Should bare `brag wrapped` (no argument) default to the CURRENT calendar year, or to the LAST-COMPLETED year the way a 'wrapped' idiomatically means a finished period?"
+    priority: medium
+    status: resolved
+    resolution: current-calendar-year
+    raised_by: claude
+    raised_at: 2026-07-06
+    resolved_at: 2026-07-07
+    assigned_to: null
+    resolution_notes: |
+      RESOLVED at SPEC-051 build per orchestrator sign-off: bare `brag
+      wrapped` defaults to the CURRENT calendar year (DEC-030 choice 2
+      holds as designed). The retrospective/last-completed framing is
+      named explicitly by the period argument (`brag wrapped 2025`), and
+      `--previous` will add last-completed uniformly across year/quarter
+      in SPEC-053 — keeping the "which period" logic in one place rather
+      than split between the default and a flag. `TestWrappedCmd_DefaultsToCurrentYear`
+      locks the behavior. The DEC-030 revisit trigger stays live: if
+      SPEC-053 design or user feedback shows the bare command is expected
+      to be retrospective, the default is a localized flip (the
+      bounded-window machinery is unaffected).
+
+      UPDATE at SPEC-053 design (2026-07-07): the `--previous` half is
+      delivered by SPEC-053 / DEC-032 — the last-completed period is the
+      uniform `--previous` modifier across impact/story/wrapped (bare
+      `wrapped --previous` = last-completed year). Design did NOT surface
+      any expectation that the bare command should be retrospective, so
+      the current-calendar-year default HOLDS and the DEC-030 revisit
+      trigger is CLOSED (no flip). "Which period" logic stays in the one
+      `--previous` mechanism, as intended.
+
+      CONFIRMED at SPEC-053 build (2026-07-07): shipped as designed. Bare
+      `brag wrapped` = current calendar year (`TestWrappedCmd_DefaultsToCurrentYear`
+      unchanged); `brag wrapped --previous` = last-completed year, byte-
+      identical to `brag wrapped 2025` in 2026 (`TestWrappedCmd_PreviousDefaultsToLastYear`).
+      No default flip. Entry stays RESOLVED; nothing further to decide.
+    notes: |
+      Filed at SPEC-051 design (DEC-030 choice 2, confidence 0.72). The
+      DEC locks the default to the CURRENT calendar year, leaving the
+      last-completed variant to the planned `--previous` modifier
+      (SPEC-053, foreseen by DEC-028). Rationale: (1) current-year mirrors
+      DEC-028 choice 1's current-in-progress default, keeping the digest
+      family consistent; (2) baking last-completed into the default now
+      would preempt SPEC-053 and split the period-selection logic across
+      two specs. The soft spot: "wrapped" idiomatically evokes the
+      finished period (Spotify Wrapped is last year's), so a user could
+      reasonably expect bare `brag wrapped` to show the completed year.
+      This is DEC-030's first revisit trigger. Resolve when SPEC-053
+      (`--previous`) is designed: if `--previous` makes last-completed a
+      one-flag away, the current-year default holds; if user feedback
+      shows the bare command is expected to be retrospective, flip the
+      default there (a localized change — the bounded-window machinery is
+      unaffected). Recorded so the default choice is explicit, not silent.
+      (Above §14's 0.7 hard threshold, filed proactively per DEC-028's
+      precedent of recording the softest sub-choice.)
+
+  - id: sparkline-default-on-and-flat-nonzero-convention
+    question: "Is default-on cadence sparkline (block glyphs in the shareable digest, escaped only by --no-spark/NO_COLOR) the right ergonomics across users' real terminals, and is rendering a flat NON-zero series identically to a flat zero one (both all ▁) acceptable, or does min→max need a magnitude-aware variant?"
+    priority: medium
+    status: resolved
+    raised_by: claude
+    raised_at: 2026-07-06
+    resolved_at: 2026-07-06
+    resolved_by: orchestrator sign-off (SPEC-052 build)
+    assigned_to: null
+    resolution: |
+      RESOLVED at SPEC-052 build per orchestrator sign-off:
+      DEFAULT-ON WITH ESCAPE. The cadence sparkline renders by default in
+      markdown, suppressed by `--no-spark` OR a present `NO_COLOR` env var
+      (no-color.org "set-to-any-value" semantics, present-at-all), read
+      through the injectable `lookupSparkEnv` package var (DEC-023 LD6
+      precedent). Deliberately NOT TTY-gated (DEC-031 D3): the wrapped
+      digest is meant to be captured/piped/pasted, so a TTY gate would
+      wrongly strip the visual on the non-TTY paths that matter most. The
+      FLAT-NONZERO CONVENTION is ACCEPTED as standard sparkline behavior:
+      `[3,3,3]` renders `▁▁▁` like `[0,0,0]` — min→max has no magnitude
+      reference and the adjacent per-month counts disambiguate; NO
+      magnitude-aware variant is added. Both remain reversible ergonomics
+      bets, not correctness ones. Paired tests (all green):
+      TestWrappedCmd_SparkDefaultOn / _NoSparkFlagSuppresses /
+      _NoColorEnvSuppresses / _NoColorEnvEmptyValueSuppresses /
+      _JSONHasNoGlyphs / _NoSparkHelpListed, plus the spark package's
+      TestLine_NormalizationTable (flat-nonzero row pins the convention).
+      Revisit trigger unchanged: if v0.4.0 dogfooding shows real-terminal
+      mojibake the escape did not cover, or the flat-nonzero-looks-empty
+      case bites in practice, revisit (a TTY-aware default with an explicit
+      override, or a magnitude-aware normalization variant) — both are
+      localized, additive changes leaving the primitive signature and the
+      JSON envelope unaffected.
+    notes: |
+      Filed at SPEC-052 design (DEC-031, confidence 0.78). The primitive,
+      normalization, placement, and JSON-stays-raw are LOCKED and
+      byte-verified. Two residual soft spots drag the composite below 0.8:
+
+      (1) DEFAULT-ON ERGONOMICS. Unicode block glyphs (U+2581..U+2588) are
+      broadly supported, and default-on is the "fun" the user asked for;
+      the escape is `--no-spark` OR a present `NO_COLOR` env var (no-color.org
+      "set-to-any-value" semantics), read through the injectable
+      `lookupSparkEnv` package var (DEC-023 LD6 precedent). The risk is a
+      glyph-hostile terminal rendering mojibake for a user who does not know
+      the escape. Deliberately NOT TTY-gated (DEC-031 D3): the wrapped digest
+      is meant to be captured/piped/pasted — non-TTY paths where a TTY gate
+      would wrongly strip the visual. Reversible and escape-hatched, so this
+      is an ergonomics bet, not a correctness one.
+
+      (2) FLAT-NONZERO CONVENTION. min→max normalization has no magnitude
+      reference, so a flat non-zero series (e.g. [3,3,3]) renders all ▁ —
+      identical to a flat zero series. Rare over a real year/quarter, and the
+      adjacent per-month counts disambiguate it, but a user could read a
+      steady-3-a-month cadence as "empty." A magnitude-aware variant (absolute
+      scale, or flat-nonzero → mid glyph) is the alternative — deferred because
+      it needs a second rule min→max deliberately lacks.
+
+      Resolve/harden when the sparkline is dogfooded in the v0.4.0 wrapped
+      digest: if a real terminal shows mojibake that the escape did not cover,
+      or the flat-nonzero-looks-empty case bites in practice, revisit (add a
+      TTY-aware DEFAULT with an explicit override, or a magnitude-aware
+      normalization variant). Both are localized, additive changes — the
+      primitive's signature and the JSON envelope are unaffected either way.

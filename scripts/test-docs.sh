@@ -1,0 +1,1144 @@
+#!/usr/bin/env bash
+# scripts/test-docs.sh — documentation-content assertions for the
+# bragfile repo. Exits 0 iff all assertions pass.
+#
+# Run via `just test-docs`. Not wired into `just test` (Go-only).
+
+set -eu
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+cd "$REPO_ROOT"
+
+FAIL_COUNT=0
+
+# Group H asserts require jq for JSON-shape parsing.
+if ! command -v jq >/dev/null 2>&1; then
+    printf 'test-docs: jq is required but not installed (see https://stedolan.github.io/jq/)\n' >&2
+    exit 2
+fi
+
+ok() {
+    printf 'OK:   %s\n' "$1"
+}
+
+fail() {
+    printf 'FAIL: %s: %s\n' "$1" "$2"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+}
+
+skip() {
+    printf 'SKIP: %s: %s\n' "$1" "$2"
+}
+
+# --- helpers ---
+
+assert_file_exists() {
+    name="$1"; path="$2"
+    if [ -f "$path" ]; then
+        ok "$name"
+    else
+        fail "$name" "file does not exist: $path"
+    fi
+}
+
+assert_line_count_band() {
+    name="$1"; path="$2"; min="$3"; max="$4"
+    if [ ! -f "$path" ]; then
+        fail "$name" "file does not exist: $path"
+        return 0
+    fi
+    n=$(wc -l < "$path" | tr -d ' ')
+    if [ "$n" -ge "$min" ] && [ "$n" -le "$max" ]; then
+        ok "$name"
+    else
+        fail "$name" "$path has $n lines (expected $min..$max)"
+    fi
+}
+
+assert_contains_literal() {
+    name="$1"; path="$2"; pattern="$3"
+    if [ ! -f "$path" ]; then
+        fail "$name" "file does not exist: $path"
+        return 0
+    fi
+    if grep -F -q -- "$pattern" "$path"; then
+        ok "$name"
+    else
+        fail "$name" "$path missing literal: $pattern"
+    fi
+}
+
+assert_cmd_ok() {
+    name="$1"; shift
+    if "$@" >/dev/null 2>&1; then
+        ok "$name"
+    else
+        fail "$name" "command failed: $*"
+    fi
+}
+
+assert_not_contains_iregex() {
+    name="$1"; path="$2"; pattern="$3"
+    if [ ! -f "$path" ]; then
+        fail "$name" "file does not exist: $path"
+        return 0
+    fi
+    if grep -i -E -q -- "$pattern" "$path"; then
+        hit=$(grep -i -n -E -- "$pattern" "$path" | head -n 1)
+        fail "$name" "$path contains forbidden pattern: $pattern (first hit: $hit)"
+    else
+        ok "$name"
+    fi
+}
+
+# Resolve $1 against $2 (source file's dir) and check existence.
+# Strips #anchor, skips http/https/mailto and bare anchors.
+check_link_target() {
+    src="$1"; src_dir="$2"; link="$3"
+    target=$(printf '%s' "$link" | sed 's/#.*$//')
+    case "$target" in
+        http://*|https://*|mailto:*) return 0 ;;
+        '') return 0 ;;
+    esac
+    if [ "$src_dir" = "." ]; then
+        resolved="$target"
+    else
+        resolved="$src_dir/$target"
+    fi
+    if [ ! -e "$resolved" ]; then
+        fail "E1" "$src: link \"$link\" → \"$resolved\" not found"
+    fi
+}
+
+# ===== Group A — README shape (positive) =====
+
+# A1 — README line count band 100..250
+assert_line_count_band "A1" "README.md" 100 250
+
+# A2 — README opens with H1 in line 1 or 2
+if [ ! -f README.md ]; then
+    fail "A2" "README.md does not exist"
+elif head -n 2 README.md | grep -E -q '^# '; then
+    ok "A2"
+else
+    fail "A2" "no '# ' heading in first 2 lines of README.md"
+fi
+
+# A3 — Above-the-fold is user-facing
+if [ ! -f README.md ]; then
+    fail "A3" "README.md does not exist"
+else
+    above=$(head -n 12 README.md)
+    has_brag=no; has_uf=no; has_forbidden=no
+    if printf '%s\n' "$above" | grep -i -q 'brag'; then has_brag=yes; fi
+    if printf '%s\n' "$above" | grep -i -E -q 'capture|retrieve|accomplishment|retro|review|resume'; then has_uf=yes; fi
+    if printf '%s\n' "$above" | grep -i -E -q 'spec-driven|architect|implementer|reviewer|cycle|hierarchy'; then has_forbidden=yes; fi
+    if [ "$has_brag" = yes ] && [ "$has_uf" = yes ] && [ "$has_forbidden" = no ]; then
+        ok "A3"
+    else
+        fail "A3" "above-the-fold gate (brag=$has_brag user-facing-word=$has_uf forbidden-token=$has_forbidden)"
+    fi
+fi
+
+# A4 — Install section with both paths
+if [ ! -f README.md ]; then
+    fail "A4" "README.md does not exist"
+else
+    has_heading=no; has_brew=no; has_local=no
+    if grep -E -q '^## .*[Ii]nstall' README.md; then has_heading=yes; fi
+    if grep -F -q 'brew install jysf/bragfile/bragfile' README.md; then has_brew=yes; fi
+    if grep -F -q 'go install ./cmd/brag' README.md || grep -F -q 'just install' README.md; then
+        has_local=yes
+    fi
+    if [ "$has_heading" = yes ] && [ "$has_brew" = yes ] && [ "$has_local" = yes ]; then
+        ok "A4"
+    else
+        fail "A4" "install section (heading=$has_heading brew=$has_brew local=$has_local)"
+    fi
+fi
+
+# A5 — Workflow-demo command coverage (all 7 brag verbs in fenced shell blocks)
+if [ ! -f README.md ]; then
+    fail "A5" "README.md does not exist"
+else
+    fenced=$(awk '/^```/{f=!f; next} f' README.md)
+    missing=""
+    for cmd in "brag add" "brag list" "brag search" "brag export" "brag summary" "brag review" "brag stats"; do
+        if ! printf '%s\n' "$fenced" | grep -F -q -- "$cmd"; then
+            missing="$missing $cmd"
+        fi
+    done
+    if [ -z "$missing" ]; then
+        ok "A5"
+    else
+        fail "A5" "missing in fenced blocks:$missing"
+    fi
+fi
+
+# A6 — Where-data-lives reference
+assert_contains_literal "A6" "README.md" "~/.bragfile/db.sqlite"
+
+# A7 — Tutorial pointer
+assert_contains_literal "A7" "README.md" "docs/tutorial.md"
+
+# A8 — BRAG.md pointer
+assert_contains_literal "A8" "README.md" "BRAG.md"
+
+# A9 — CONTRIBUTING.md pointer
+assert_contains_literal "A9" "README.md" "CONTRIBUTING.md"
+
+# A10 — License section
+if [ ! -f README.md ]; then
+    fail "A10" "README.md does not exist"
+else
+    has_heading=no; has_mit=no
+    if grep -E -q '^## [Ll]icense' README.md; then has_heading=yes; fi
+    if grep -F -q 'MIT' README.md; then has_mit=yes; fi
+    if [ "$has_heading" = yes ] && [ "$has_mit" = yes ]; then
+        ok "A10"
+    else
+        fail "A10" "license section (heading=$has_heading mit=$has_mit)"
+    fi
+fi
+
+# ===== Group B — README shape (negative — load-bearing) =====
+
+# B1 — No `spec-driven` token
+assert_not_contains_iregex "B1" "README.md" 'spec-driven'
+
+# B2 — No cycle phrase (any of three forms)
+if [ ! -f README.md ]; then
+    fail "B2" "README.md does not exist"
+else
+    hit=""
+    if grep -i -E -q 'frame.*design.*build.*verify.*ship' README.md; then
+        hit="${hit} regex-form"
+    fi
+    if grep -i -F -q 'frame → design' README.md; then
+        hit="${hit} unicode-arrow-form"
+    fi
+    if grep -i -F -q 'frame -> design' README.md; then
+        hit="${hit} ascii-arrow-form"
+    fi
+    if [ -z "$hit" ]; then
+        ok "B2"
+    else
+        fail "B2" "cycle phrase present:$hit"
+    fi
+fi
+
+# B3 — No `four habits` phrase
+assert_not_contains_iregex "B3" "README.md" 'four habits'
+
+# B4 — No `context contamination` phrase
+assert_not_contains_iregex "B4" "README.md" 'context contamination'
+
+# B5 — No contributor-shaped just-recipe refs
+assert_not_contains_iregex "B5" "README.md" 'just (new-spec|advance-cycle|archive-spec|weekly-review|new-stage)'
+
+# B6 — No `Claude plays every role` phrase
+assert_not_contains_iregex "B6" "README.md" 'claude plays every role'
+
+# B7-heading — No `## … table of contents` heading
+assert_not_contains_iregex "B7-heading" "README.md" '^## .*table of contents'
+
+# B7-toc — No 4+ contiguous `- [` lines in first 50 lines
+if [ ! -f README.md ]; then
+    fail "B7-toc" "README.md does not exist"
+else
+    streak=$(head -n 50 README.md | awk '
+        /^- \[/ { s += 1; if (s > max) max = s; next }
+        { s = 0 }
+        END { print (max ? max : 0) }
+    ')
+    if [ "$streak" -lt 4 ]; then
+        ok "B7-toc"
+    else
+        fail "B7-toc" "found contiguous run of $streak '- [' lines in first 50 lines (TOC block)"
+    fi
+fi
+
+# ===== Group C — CONTRIBUTING.md =====
+
+assert_file_exists "C1" "CONTRIBUTING.md"
+assert_line_count_band "C2" "CONTRIBUTING.md" 30 120
+assert_contains_literal "C3" "CONTRIBUTING.md" "docs/development.md"
+assert_contains_literal "C4" "CONTRIBUTING.md" "AGENTS.md"
+
+# C5 — Setup commands: just install AND just test
+if [ ! -f CONTRIBUTING.md ]; then
+    fail "C5" "CONTRIBUTING.md does not exist"
+else
+    has_install=no; has_test=no
+    if grep -F -q 'just install' CONTRIBUTING.md; then has_install=yes; fi
+    if grep -F -q 'just test' CONTRIBUTING.md; then has_test=yes; fi
+    if [ "$has_install" = yes ] && [ "$has_test" = yes ]; then
+        ok "C5"
+    else
+        fail "C5" "setup commands (just install=$has_install just test=$has_test)"
+    fi
+fi
+
+# ===== Group D — docs/development.md =====
+
+assert_file_exists "D1" "docs/development.md"
+assert_line_count_band "D2" "docs/development.md" 50 200
+
+# D3 — Hierarchy present (Repo + Project + Stage + Spec)
+if [ ! -f docs/development.md ]; then
+    fail "D3" "docs/development.md does not exist"
+else
+    missing=""
+    for tok in Repo Project Stage Spec; do
+        if ! grep -i -F -q -- "$tok" docs/development.md; then
+            missing="$missing $tok"
+        fi
+    done
+    if [ -z "$missing" ]; then
+        ok "D3"
+    else
+        fail "D3" "hierarchy tokens missing:$missing"
+    fi
+fi
+
+# D4 — Cycle phrase present (Unicode-arrow form, exact substring)
+assert_contains_literal "D4" "docs/development.md" "Frame → Design → Build → Verify → Ship"
+
+assert_contains_literal "D5" "docs/development.md" "AGENTS.md"
+assert_contains_literal "D6" "docs/development.md" "GETTING_STARTED.md"
+assert_contains_literal "D7" "docs/development.md" "FIRST_SESSION_PROMPTS.md"
+
+# D8 — Glossary cross-link: AGENTS.md mention within ±5 lines of 'glossary'
+if [ ! -f docs/development.md ]; then
+    fail "D8" "docs/development.md does not exist"
+else
+    agents_lines=$(grep -n -F 'AGENTS.md' docs/development.md | cut -d: -f1)
+    glossary_lines=$(grep -n -i -F 'glossary' docs/development.md | cut -d: -f1)
+    if [ -z "$agents_lines" ] || [ -z "$glossary_lines" ]; then
+        fail "D8" "missing AGENTS.md mention or 'glossary' mention"
+    else
+        min_diff=999999
+        for a in $agents_lines; do
+            for g in $glossary_lines; do
+                d=$(( a > g ? a - g : g - a ))
+                if [ "$d" -lt "$min_diff" ]; then
+                    min_diff=$d
+                fi
+            done
+        done
+        if [ "$min_diff" -le 5 ]; then
+            ok "D8"
+        else
+            fail "D8" "closest AGENTS.md/glossary line distance is $min_diff (>5)"
+        fi
+    fi
+fi
+
+# ===== Group E — Link integrity =====
+
+# E1 — Internal links resolve in README, CONTRIBUTING, development.md
+e1_pre_count=$FAIL_COUNT
+for src in README.md CONTRIBUTING.md docs/development.md; do
+    [ -f "$src" ] || continue
+    src_dir=$(dirname "$src")
+    # Extract every ](url) and strip surrounding markers
+    while IFS= read -r raw; do
+        [ -n "$raw" ] || continue
+        link=$(printf '%s' "$raw" | sed -E 's/^]\((.*)\)$/\1/')
+        check_link_target "$src" "$src_dir" "$link"
+    done <<EOF
+$(grep -oE '\]\([^)]+\)' "$src" || true)
+EOF
+done
+if [ "$FAIL_COUNT" -eq "$e1_pre_count" ]; then
+    ok "E1"
+fi
+
+# E2 — docs/development.md only referenced by this spec's outputs
+hits=$(grep -rn -F 'docs/development.md' . \
+    --include='*.md' \
+    --exclude-dir=projects \
+    --exclude-dir=node_modules \
+    --exclude-dir=.git \
+    --exclude-dir=framework-feedback \
+    --exclude-dir=docs/reports 2>/dev/null || true)
+unexpected=""
+if [ -n "$hits" ]; then
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        path=$(printf '%s' "$line" | cut -d: -f1)
+        case "$path" in
+            ./README.md|./CONTRIBUTING.md|./docs/development.md) ;;
+            *) unexpected="${unexpected}\n  $line" ;;
+        esac
+    done <<EOF
+$hits
+EOF
+fi
+if [ -z "$unexpected" ]; then
+    ok "E2"
+else
+    fail "E2" "unexpected references to docs/development.md:$(printf '%b' "$unexpected")"
+fi
+
+# E3 — CONTRIBUTING.md is brand-new (no prior deletion in git history)
+prior=$(git log --all --diff-filter=D --pretty=format:%H -- CONTRIBUTING.md 2>/dev/null || true)
+if [ -z "$prior" ]; then
+    ok "E3"
+else
+    fail "E3" "prior deletion(s) of CONTRIBUTING.md in git history: $prior"
+fi
+
+# ===== Group F — Just-recipe wiring =====
+
+# F1 — `test-docs` recipe defined
+if [ ! -f justfile ]; then
+    fail "F1" "justfile does not exist"
+elif grep -E -q '^test-docs:' justfile; then
+    ok "F1"
+else
+    fail "F1" "no '^test-docs:' recipe in justfile"
+fi
+
+# F2 — `test:` recipe unchanged from pre-spec form (header + `    @go test ./...`)
+if [ ! -f justfile ]; then
+    fail "F2" "justfile does not exist"
+else
+    actual=$(awk '/^test:$/{f=1; print; next} f && /^$/{exit} f{print}' justfile)
+    expected="$(printf 'test:\n    @go test ./...')"
+    if [ "$actual" = "$expected" ]; then
+        ok "F2"
+    else
+        fail "F2" "test: recipe diverged from pre-spec form"
+    fi
+fi
+
+# F3 — scripts/test-docs.sh executable + POSIX-headed shebang
+if [ ! -f scripts/test-docs.sh ]; then
+    fail "F3" "scripts/test-docs.sh does not exist"
+else
+    is_exec=no; shebang_ok=no
+    if [ -x scripts/test-docs.sh ]; then is_exec=yes; fi
+    if head -n 1 scripts/test-docs.sh | grep -E -q '^#!(/usr/bin/env (sh|bash)|/bin/sh)'; then
+        shebang_ok=yes
+    fi
+    if [ "$is_exec" = yes ] && [ "$shebang_ok" = yes ]; then
+        ok "F3"
+    else
+        fail "F3" "executable=$is_exec posix-shebang=$shebang_ok"
+    fi
+fi
+
+# ===== Group G — Harness ergonomics =====
+
+# G3 — Works from any cwd (verified by SCRIPT_DIR pattern at top of script)
+if grep -q 'SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)' scripts/test-docs.sh; then
+    ok "G3"
+else
+    fail "G3" "scripts/test-docs.sh missing SCRIPT_DIR resolution pattern"
+fi
+
+# G2 — Exit-code contract is built-in (FAIL_COUNT-driven exit at the bottom)
+ok "G2"
+
+# ===== Group H — JSON Schema shape =====
+
+SCHEMA_PATH="docs/brag-entry.schema.json"
+
+# H1 — Schema file exists
+assert_file_exists "H1" "$SCHEMA_PATH"
+
+# H2 — Schema is valid JSON
+if [ -f "$SCHEMA_PATH" ]; then
+    if jq -e . "$SCHEMA_PATH" >/dev/null 2>&1; then
+        ok "H2"
+    else
+        fail "H2" "$SCHEMA_PATH is not valid JSON"
+    fi
+else
+    fail "H2" "$SCHEMA_PATH does not exist"
+fi
+
+# Helper for jq-based equality checks against the schema. Compares
+# the jq-extracted value against an expected literal string.
+assert_jq_eq() {
+    name="$1"; expr="$2"; expected="$3"
+    if [ ! -f "$SCHEMA_PATH" ]; then
+        fail "$name" "$SCHEMA_PATH does not exist"
+        return 0
+    fi
+    actual=$(jq -r "$expr" "$SCHEMA_PATH" 2>/dev/null || echo "<jq-error>")
+    if [ "$actual" = "$expected" ]; then
+        ok "$name"
+    else
+        fail "$name" "$expr returned \"$actual\" (expected \"$expected\")"
+    fi
+}
+
+# H3 — Schema declares draft 2020-12
+assert_jq_eq "H3" '."$schema"' "https://json-schema.org/draft/2020-12/schema"
+
+# H4 — Schema declares object type at root
+assert_jq_eq "H4" '.type' "object"
+
+# H5 — Schema requires title
+if [ -f "$SCHEMA_PATH" ]; then
+    if jq -e '.required | index("title")' "$SCHEMA_PATH" >/dev/null 2>&1; then
+        ok "H5"
+    else
+        fail "H5" '"title" not found in .required array'
+    fi
+else
+    fail "H5" "$SCHEMA_PATH does not exist"
+fi
+
+# H6 — Schema disallows additional properties
+assert_jq_eq "H6" '.additionalProperties' "false"
+
+# H7 — Title is non-empty string
+if [ -f "$SCHEMA_PATH" ]; then
+    title_type=$(jq -r '.properties.title.type' "$SCHEMA_PATH" 2>/dev/null || echo "")
+    title_min=$(jq -r '.properties.title.minLength' "$SCHEMA_PATH" 2>/dev/null || echo "")
+    if [ "$title_type" = "string" ] && [ "$title_min" = "1" ]; then
+        ok "H7"
+    else
+        fail "H7" "properties.title.type=\"$title_type\" minLength=\"$title_min\" (want type=\"string\" minLength=\"1\")"
+    fi
+else
+    fail "H7" "$SCHEMA_PATH does not exist"
+fi
+
+# H8 — Tags is string (NOT array) — DEC-004 alignment, load-bearing
+assert_jq_eq "H8" '.properties.tags.type' "string"
+
+# H9 — All nine DEC-011 keys present in properties
+if [ -f "$SCHEMA_PATH" ]; then
+    h9_missing=""
+    for key in title description tags project type impact id created_at updated_at; do
+        if ! jq -e ".properties.$key" "$SCHEMA_PATH" >/dev/null 2>&1; then
+            h9_missing="$h9_missing $key"
+        fi
+    done
+    if [ -z "$h9_missing" ]; then
+        ok "H9"
+    else
+        fail "H9" "missing properties:$h9_missing"
+    fi
+else
+    fail "H9" "$SCHEMA_PATH does not exist"
+fi
+
+# H10 — Schema declares canonical $id URL
+assert_jq_eq "H10" '."$id"' "https://github.com/jysf/bragfile000/blob/main/docs/brag-entry.schema.json"
+
+# ===== Group I — Hook script shape =====
+
+HOOK_PATH="scripts/claude-code-post-session.sh"
+
+# I1 — Hook script exists
+assert_file_exists "I1" "$HOOK_PATH"
+
+# I2 — Hook script is executable
+if [ -x "$HOOK_PATH" ]; then
+    ok "I2"
+else
+    fail "I2" "$HOOK_PATH is not executable (chmod +x)"
+fi
+
+# I3 — Hook script has POSIX shebang on line 1
+if [ ! -f "$HOOK_PATH" ]; then
+    fail "I3" "$HOOK_PATH does not exist"
+elif head -n 1 "$HOOK_PATH" | grep -E -q '^#!(/usr/bin/env (sh|bash)|/bin/sh)'; then
+    ok "I3"
+else
+    fail "I3" "$HOOK_PATH missing POSIX shebang on line 1"
+fi
+
+# I4 — Hook script references `brag add --json`
+assert_contains_literal "I4" "$HOOK_PATH" "brag add --json"
+
+# I5 — Hook script references `jq`
+assert_contains_literal "I5" "$HOOK_PATH" "jq"
+
+# ===== Group J — Slash-command template shape =====
+
+SLASH_PATH="examples/brag-slash-command.md"
+
+# J1 — Template file exists
+assert_file_exists "J1" "$SLASH_PATH"
+
+# J2 — Template is tight (5–30 lines)
+assert_line_count_band "J2" "$SLASH_PATH" 5 30
+
+# J3 — Template references the schema
+assert_contains_literal "J3" "$SLASH_PATH" "docs/brag-entry.schema.json"
+
+# J4 — Template references `brag add --json`
+assert_contains_literal "J4" "$SLASH_PATH" "brag add --json"
+
+# ===== Group K — BRAG.md cross-reference =====
+
+# K1 — BRAG.md references the schema
+assert_contains_literal "K1" "BRAG.md" "docs/brag-entry.schema.json"
+
+# K2 — BRAG.md references the hook script
+assert_contains_literal "K2" "BRAG.md" "scripts/claude-code-post-session.sh"
+
+# K3 — BRAG.md references the slash-command template
+assert_contains_literal "K3" "BRAG.md" "examples/brag-slash-command.md"
+
+# K4 — BRAG.md has a JSON-contract section heading
+if [ ! -f BRAG.md ]; then
+    fail "K4" "BRAG.md does not exist"
+elif grep -E -q '^## .*JSON' BRAG.md; then
+    ok "K4"
+else
+    fail "K4" "no '## … JSON …' heading in BRAG.md"
+fi
+
+# ===== Group L — .goreleaser.yaml shape =====
+
+GORELEASER="${REPO_ROOT}/.goreleaser.yaml"
+
+# L1 — config file exists
+assert_file_exists "L1" "$GORELEASER"
+
+# L2 — opens with `version: 2`
+if [ ! -f "$GORELEASER" ]; then
+    fail "L2" "$GORELEASER does not exist"
+elif head -n 5 "$GORELEASER" | grep -E -q '^version:[[:space:]]+2[[:space:]]*$'; then
+    ok "L2"
+else
+    fail "L2" "$GORELEASER does not declare 'version: 2' in first 5 lines"
+fi
+
+# L3 — declares CGO_ENABLED=0
+assert_contains_literal "L3" "$GORELEASER" "CGO_ENABLED=0"
+
+# L4 — declares both darwin and linux goos values
+assert_contains_literal "L4a" "$GORELEASER" "- darwin"
+assert_contains_literal "L4b" "$GORELEASER" "- linux"
+
+# L5 — declares both amd64 and arm64 goarch values
+assert_contains_literal "L5a" "$GORELEASER" "- amd64"
+assert_contains_literal "L5b" "$GORELEASER" "- arm64"
+
+# L6 — declares a top-level `homebrew_casks:` block
+if [ ! -f "$GORELEASER" ]; then
+    fail "L6" "$GORELEASER does not exist"
+elif grep -E -q '^homebrew_casks:[[:space:]]*$' "$GORELEASER"; then
+    ok "L6"
+else
+    fail "L6" "$GORELEASER does not declare a top-level 'homebrew_casks:' block"
+fi
+
+# L7 — homebrew_casks block points at homebrew-bragfile
+assert_contains_literal "L7" "$GORELEASER" "name: homebrew-bragfile"
+
+# L8 — homebrew_casks block has `skip_upload: auto`
+assert_contains_literal "L8" "$GORELEASER" "skip_upload: auto"
+
+# L9 — declares `-X main.version=` ldflag
+assert_contains_literal "L9" "$GORELEASER" "-X main.version="
+
+# L10 — archive format is `tar.gz` (goreleaser v2 list form)
+assert_contains_literal "L10" "$GORELEASER" "formats: [tar.gz]"
+
+# L11 — homebrew_casks block symlinks the `brag` binary onto $PATH
+assert_contains_literal "L11" "$GORELEASER" "- brag"
+
+# ===== Group M — .github/workflows/ci.yml shape =====
+
+CI_WORKFLOW=".github/workflows/ci.yml"
+
+# M1 — file exists
+assert_file_exists "M1" "$CI_WORKFLOW"
+
+# M2 — triggers on pull_request
+assert_contains_literal "M2" "$CI_WORKFLOW" "pull_request:"
+
+# M3 — triggers on push to main (push: stanza followed by branches: + main)
+if [ ! -f "$CI_WORKFLOW" ]; then
+    fail "M3" "$CI_WORKFLOW does not exist"
+elif awk '
+        /^on:/ { in_on=1; next }
+        in_on && /^[a-zA-Z]/ { in_on=0 }
+        in_on && /push:/ { in_push=1; next }
+        in_push && /branches:/ { in_branches=1; next }
+        in_branches && /- main/ { print "ok"; exit }
+    ' "$CI_WORKFLOW" | grep -q ok; then
+    ok "M3"
+else
+    fail "M3" "$CI_WORKFLOW does not trigger on push to main"
+fi
+
+# M4 — matrix includes macos-latest
+assert_contains_literal "M4" "$CI_WORKFLOW" "macos-latest"
+
+# M5 — matrix includes ubuntu-latest
+assert_contains_literal "M5" "$CI_WORKFLOW" "ubuntu-latest"
+
+# M6 — runs `go test ./...`
+assert_contains_literal "M6" "$CI_WORKFLOW" "go test ./..."
+
+# M7 — runs `gofmt -l .`
+assert_contains_literal "M7" "$CI_WORKFLOW" "gofmt -l ."
+
+# M8 — runs `go vet ./...`
+assert_contains_literal "M8" "$CI_WORKFLOW" "go vet ./..."
+
+# M9 — uses actions/setup-go (SHA-pinned; version in comment)
+assert_contains_literal "M9" "$CI_WORKFLOW" "actions/setup-go@"
+
+# ===== Group N — .github/workflows/release.yml shape =====
+
+RELEASE_WORKFLOW=".github/workflows/release.yml"
+
+# N1 — file exists
+assert_file_exists "N1" "$RELEASE_WORKFLOW"
+
+# N2 — triggers on tag push pattern v*
+if [ ! -f "$RELEASE_WORKFLOW" ]; then
+    fail "N2" "$RELEASE_WORKFLOW does not exist"
+elif grep -E -q "^[[:space:]]+- 'v\\*'" "$RELEASE_WORKFLOW"; then
+    ok "N2"
+else
+    fail "N2" "$RELEASE_WORKFLOW does not trigger on tag pattern 'v*'"
+fi
+
+# N3 — uses goreleaser/goreleaser-action (SHA-pinned; version in comment)
+assert_contains_literal "N3" "$RELEASE_WORKFLOW" "goreleaser/goreleaser-action@"
+
+# N4 — passes HOMEBREW_TAP_GITHUB_TOKEN env
+assert_contains_literal "N4" "$RELEASE_WORKFLOW" "HOMEBREW_TAP_GITHUB_TOKEN"
+
+# N5 — checkout uses fetch-depth: 0
+assert_contains_literal "N5" "$RELEASE_WORKFLOW" "fetch-depth: 0"
+
+# N6 — job declares timeout-minutes: 30
+assert_contains_literal "N6" "$RELEASE_WORKFLOW" "timeout-minutes: 30"
+
+# N7 — workflow declares concurrency block
+assert_contains_literal "N7" "$RELEASE_WORKFLOW" "concurrency:"
+
+# ===== Group O — CHANGELOG.md shape =====
+
+# O1 — file exists
+assert_file_exists "O1" "CHANGELOG.md"
+
+# O2 — references Keep-A-Changelog
+assert_contains_literal "O2" "CHANGELOG.md" "keepachangelog.com"
+
+# O3 — has `## [0.1.0]` heading (line-based equality avoids substring trap)
+if [ ! -f CHANGELOG.md ]; then
+    fail "O3" "CHANGELOG.md does not exist"
+elif grep -E -q '^## \[0\.1\.0\]' CHANGELOG.md; then
+    ok "O3"
+else
+    fail "O3" "CHANGELOG.md missing '## [0.1.0]' heading"
+fi
+
+# O4 — lists each shipped command verb under Added (single named
+# assertion that iterates internally over the ten verbs)
+o4_failed=""
+for verb in "brag add" "brag list" "brag show" "brag edit" "brag delete" \
+            "brag search" "brag export" "brag summary" "brag review" "brag stats"; do
+    if ! grep -F -q -- "\`${verb}\`" CHANGELOG.md; then
+        o4_failed="${o4_failed} ${verb}"
+    fi
+done
+if [ -z "$o4_failed" ]; then
+    ok "O4"
+else
+    fail "O4" "CHANGELOG.md missing command refs:$o4_failed"
+fi
+
+# O5 — has [Unreleased] and [0.1.0] link reference definitions
+o5_failed=""
+for ref in "[Unreleased]:" "[0.1.0]:"; do
+    if ! grep -F -q -- "$ref" CHANGELOG.md; then
+        o5_failed="${o5_failed} ${ref}"
+    fi
+done
+if [ -z "$o5_failed" ]; then
+    ok "O5"
+else
+    fail "O5" "CHANGELOG.md missing link refs:$o5_failed"
+fi
+
+# ===== Group P — Doc sweep + tense flips =====
+
+# P1 — README.md status banner does NOT contain "in progress"
+assert_not_contains_iregex "P1" "README.md" "in progress"
+
+# P2 — README.md does NOT contain "in active development"
+assert_not_contains_iregex "P2" "README.md" "in active development"
+
+# P3 — AGENTS.md does NOT contain "arriving in STAGE"
+assert_not_contains_iregex "P3" "AGENTS.md" "arriving in STAGE"
+
+# P4 — AGENTS.md does NOT contain literal `(STAGE-004)`
+assert_not_contains_iregex "P4" "AGENTS.md" "\\(STAGE-004\\)"
+
+# P5 — docs/architecture.md does NOT contain "sqlite-file-copy"
+assert_not_contains_iregex "P5" "docs/architecture.md" "sqlite-file-copy"
+
+# P6 — docs/architecture.md does NOT contain "Distribution (STAGE-004)"
+assert_not_contains_iregex "P6" "docs/architecture.md" "Distribution \\(STAGE-004\\)"
+
+# P7 — docs/tutorial.md §9 body does NOT contain `brew install`
+# (sectioned slice from the §9 heading to the next ## or --- divider)
+if [ ! -f docs/tutorial.md ]; then
+    fail "P7" "docs/tutorial.md does not exist"
+else
+    section_body=$(awk '
+        /^## 9\./ { in_section=1; next }
+        in_section && /^## / { in_section=0 }
+        in_section && /^---[[:space:]]*$/ { in_section=0 }
+        in_section { print }
+    ' docs/tutorial.md)
+    if printf '%s' "$section_body" | grep -F -q "brew install"; then
+        fail "P7" "docs/tutorial.md §9 body contains 'brew install'"
+    else
+        ok "P7"
+    fi
+fi
+
+# P8 — cmd/brag/main.go does NOT contain literal STAGE-004
+assert_not_contains_iregex "P8" "cmd/brag/main.go" "STAGE-004"
+
+# P9 — BRAG.md still references SPEC-022 artifacts (regression check)
+p9_failed=""
+for art in "docs/brag-entry.schema.json" \
+           "scripts/claude-code-post-session.sh" \
+           "examples/brag-slash-command.md"; do
+    if ! grep -F -q -- "$art" BRAG.md; then
+        p9_failed="${p9_failed} ${art}"
+    fi
+done
+if [ -z "$p9_failed" ]; then
+    ok "P9"
+else
+    fail "P9" "BRAG.md missing SPEC-022 artifact refs:$p9_failed"
+fi
+
+# P10 — README.md does NOT contain "(recommended once available)"
+assert_not_contains_iregex "P10" "README.md" "recommended once available"
+
+# ===== Group Q — completion subcommand source shape =====
+
+# Q1 — internal/cli/completion.go exists
+assert_file_exists "Q1" "internal/cli/completion.go"
+
+# Q2 — internal/cli/completion_test.go exists
+assert_file_exists "Q2" "internal/cli/completion_test.go"
+
+# Q3 — completion.go wires GenZshCompletion
+assert_contains_literal "Q3" "internal/cli/completion.go" "GenZshCompletion"
+
+# Q4 — completion.go wires GenBashCompletion
+assert_contains_literal "Q4" "internal/cli/completion.go" "GenBashCompletion"
+
+# Q5 — completion.go wires GenFishCompletion
+assert_contains_literal "Q5" "internal/cli/completion.go" "GenFishCompletion"
+
+# ===== Group R — tutorial §10 shell completions addendum =====
+
+# R1 — tutorial §10 heading exists (line-regex avoids substring trap)
+if [ ! -f docs/tutorial.md ]; then
+    fail "R1" "docs/tutorial.md does not exist"
+elif grep -E -q '^## 10\. Shell completions' docs/tutorial.md; then
+    ok "R1"
+else
+    fail "R1" "docs/tutorial.md missing '## 10. Shell completions' heading"
+fi
+
+# R2 — tutorial contains zsh sourcing example
+assert_contains_literal "R2" "docs/tutorial.md" "source <(brag completion zsh)"
+
+# R3 — tutorial contains bash sourcing example
+assert_contains_literal "R3" "docs/tutorial.md" "source <(brag completion bash)"
+
+# R4 — tutorial contains fish sourcing example
+assert_contains_literal "R4" "docs/tutorial.md" "brag completion fish | source"
+
+# ===== Group S — Claude Code plugin packaging (SPEC-041) =====
+#
+# NOTE: SPEC-041 names this "group K" in its own numbering, but the letter K
+# was already taken by the pre-existing "BRAG.md cross-reference" group above
+# (K1-K4). Reusing K here would collide with those assertion names, so this
+# group is lettered S (the next unused letter after R) instead; the test IDs
+# below (S1-S11) map 1:1 to the spec's K1-K11. Deviation recorded in SPEC-041
+# Build Completion.
+
+PLUGIN_MANIFEST="plugin/.claude-plugin/plugin.json"
+MARKETPLACE_MANIFEST=".claude-plugin/marketplace.json"
+
+# S1 — plugin manifest file exists
+assert_file_exists "S1" "$PLUGIN_MANIFEST"
+
+# S2 — claude plugin validate --strict plugin exits 0 (skip if claude CLI absent)
+if command -v claude >/dev/null 2>&1; then
+    assert_cmd_ok "S2" claude plugin validate --strict plugin
+else
+    skip "S2" "claude CLI not installed"
+fi
+
+# S2-jq — structural fallback (always runs, independent of the claude CLI)
+if [ -f "$PLUGIN_MANIFEST" ] && jq -e '.name=="brag" and (.mcpServers.brag.command=="brag")' "$PLUGIN_MANIFEST" >/dev/null 2>&1; then
+    ok "S2-jq"
+else
+    fail "S2-jq" "$PLUGIN_MANIFEST missing name==\"brag\" or mcpServers.brag.command==\"brag\""
+fi
+
+# S3 — marketplace manifest exists + validates strict (skip if claude CLI absent)
+assert_file_exists "S3" "$MARKETPLACE_MANIFEST"
+if command -v claude >/dev/null 2>&1; then
+    assert_cmd_ok "S3" claude plugin validate --strict .
+else
+    skip "S3" "claude CLI not installed"
+fi
+
+# S3-jq — structural fallback (always runs)
+if [ -f "$MARKETPLACE_MANIFEST" ] && jq -e '.description and (.plugins[0].name=="brag") and (.plugins[0].source=="./plugin")' "$MARKETPLACE_MANIFEST" >/dev/null 2>&1; then
+    ok "S3-jq"
+else
+    fail "S3-jq" "$MARKETPLACE_MANIFEST missing description, plugins[0].name==\"brag\", or plugins[0].source==\"./plugin\""
+fi
+
+# S4 — mcpServers.brag runs `brag mcp serve`
+if [ -f "$PLUGIN_MANIFEST" ] && jq -e '.mcpServers.brag.args==["mcp","serve"]' "$PLUGIN_MANIFEST" >/dev/null 2>&1; then
+    ok "S4"
+else
+    fail "S4" "$PLUGIN_MANIFEST missing mcpServers.brag.args==[\"mcp\",\"serve\"]"
+fi
+
+# S5 — slash-command file exists
+assert_file_exists "S5" "plugin/commands/brag.md"
+
+# S6 — slash-command names the approval gate + the tool it gates
+if [ ! -f plugin/commands/brag.md ]; then
+    fail "S6" "plugin/commands/brag.md does not exist"
+else
+    has_gate=no; has_tool=no
+    if grep -F -q 'Do not execute' plugin/commands/brag.md; then has_gate=yes; fi
+    if grep -F -q 'brag add --json' plugin/commands/brag.md; then has_tool=yes; fi
+    if [ "$has_gate" = yes ] && [ "$has_tool" = yes ]; then
+        ok "S6"
+    else
+        fail "S6" "approval gate (gate=$has_gate tool=$has_tool)"
+    fi
+fi
+
+# S7 — Stop hook wired to capture-nudge.sh via ${CLAUDE_PLUGIN_ROOT}
+if [ -f plugin/hooks/hooks.json ] && jq -e '.hooks.Stop[0].hooks[0].command | test("CLAUDE_PLUGIN_ROOT.*capture-nudge.sh")' plugin/hooks/hooks.json >/dev/null 2>&1; then
+    ok "S7"
+else
+    fail "S7" "plugin/hooks/hooks.json missing Stop hook wired to CLAUDE_PLUGIN_ROOT/.../capture-nudge.sh"
+fi
+
+# S8 — provenance convention documented in the shipped hook
+if [ ! -f plugin/hooks/capture-nudge.sh ]; then
+    fail "S8" "plugin/hooks/capture-nudge.sh does not exist"
+else
+    has_agent=no; has_model=no
+    if grep -F -q 'agent:<name>' plugin/hooks/capture-nudge.sh; then has_agent=yes; fi
+    if grep -F -q 'model:<id>' plugin/hooks/capture-nudge.sh; then has_model=yes; fi
+    if [ "$has_agent" = yes ] && [ "$has_model" = yes ]; then
+        ok "S8"
+    else
+        fail "S8" "provenance convention (agent:<name>=$has_agent model:<id>=$has_model)"
+    fi
+fi
+
+# S9 — plugin README documents the PATH prerequisite + provenance
+if [ ! -f plugin/README.md ]; then
+    fail "S9" "plugin/README.md does not exist"
+else
+    has_brew=no; has_agent=no
+    if grep -F -q 'brew install' plugin/README.md; then has_brew=yes; fi
+    if grep -F -q 'agent:' plugin/README.md; then has_agent=yes; fi
+    if [ "$has_brew" = yes ] && [ "$has_agent" = yes ]; then
+        ok "S9"
+    else
+        fail "S9" "plugin/README.md (brew install=$has_brew agent:=$has_agent)"
+    fi
+fi
+
+# S10 — BRAG.md documents both the plugin path and the provenance convention
+if [ ! -f BRAG.md ]; then
+    fail "S10" "BRAG.md does not exist"
+else
+    has_plugin=no; has_agent=no
+    if grep -F -q 'plugin' BRAG.md; then has_plugin=yes; fi
+    if grep -F -q 'agent:<name>' BRAG.md; then has_agent=yes; fi
+    if [ "$has_plugin" = yes ] && [ "$has_agent" = yes ]; then
+        ok "S10"
+    else
+        fail "S10" "BRAG.md (plugin=$has_plugin agent:<name>=$has_agent)"
+    fi
+fi
+
+# S11 — capture-nudge.sh is executable
+if [ -x plugin/hooks/capture-nudge.sh ]; then
+    ok "S11"
+else
+    fail "S11" "plugin/hooks/capture-nudge.sh is not executable (chmod +x)"
+fi
+
+# S12 — plugin/.mcp.json declares the brag MCP server (SPEC-041 punch-list
+# regression guard). `claude plugin validate --strict` and S2/S2-jq/S4 all
+# stayed green while the loader registered 0 MCP servers at runtime, because
+# registration reads plugin/.mcp.json, not the inline plugin.json mcpServers
+# key — this assertion fails loudly if .mcp.json goes missing or drifts.
+PLUGIN_MCP_JSON="plugin/.mcp.json"
+assert_file_exists "S12" "$PLUGIN_MCP_JSON"
+if [ -f "$PLUGIN_MCP_JSON" ] && jq -e '.brag.command=="brag" and (.brag.args==["mcp","serve"])' "$PLUGIN_MCP_JSON" >/dev/null 2>&1; then
+    ok "S12-jq"
+else
+    fail "S12-jq" "$PLUGIN_MCP_JSON missing brag.command==\"brag\" or brag.args==[\"mcp\",\"serve\"]"
+fi
+
+# ===== Group T — for-ai-agents docs (SPEC-058) =====
+
+AGENT_DOC="docs/for-ai-agents.md"
+
+# T1 — page exists
+assert_file_exists "T1" "$AGENT_DOC"
+
+# T2 — page is a full playbook, not a stub
+assert_line_count_band "T2" "$AGENT_DOC" 120 500
+
+# T3 — names all four MCP tools
+if [ ! -f "$AGENT_DOC" ]; then
+    fail "T3" "$AGENT_DOC does not exist"
+else
+    t3_missing=""
+    for tool in brag_add brag_list brag_search brag_stats; do
+        if ! grep -F -q -- "$tool" "$AGENT_DOC"; then
+            t3_missing="$t3_missing $tool"
+        fi
+    done
+    if [ -z "$t3_missing" ]; then
+        ok "T3"
+    else
+        fail "T3" "$AGENT_DOC missing tool names:$t3_missing"
+    fi
+fi
+
+# T4 — documents the registration command
+assert_contains_literal "T4" "$AGENT_DOC" "brag mcp install"
+
+# T5 — gives the manual mcpServers JSON snippet
+assert_contains_literal "T5" "$AGENT_DOC" '{"mcpServers":{"brag":{"command":"brag","args":["mcp","serve"]}}}'
+
+# T6 — states the client-startup-reconnect note
+if [ ! -f "$AGENT_DOC" ]; then
+    fail "T6" "$AGENT_DOC does not exist"
+else
+    has_startup=no; has_reconnect=no
+    if grep -F -q -- "connect at client startup" "$AGENT_DOC"; then has_startup=yes; fi
+    if grep -F -q -- "reconnect" "$AGENT_DOC"; then has_reconnect=yes; fi
+    if [ "$has_startup" = yes ] && [ "$has_reconnect" = yes ]; then
+        ok "T6"
+    else
+        fail "T6" "reconnect note (startup=$has_startup reconnect=$has_reconnect)"
+    fi
+fi
+
+# T7 — states the project-not-auto-filled gotcha (names the field)
+if [ ! -f "$AGENT_DOC" ]; then
+    fail "T7" "$AGENT_DOC does not exist"
+else
+    has_phrase=no; has_field=no
+    if grep -F -q -- "does not auto-fill" "$AGENT_DOC"; then has_phrase=yes; fi
+    if grep -F -q -- "project" "$AGENT_DOC"; then has_field=yes; fi
+    if [ "$has_phrase" = yes ] && [ "$has_field" = yes ]; then
+        ok "T7"
+    else
+        fail "T7" "gotcha (phrase=$has_phrase field=$has_field)"
+    fi
+fi
+
+# T8 — cross-links the fix
+assert_contains_literal "T8" "$AGENT_DOC" "brag project ensure"
+
+# T9 — documents provenance stamping (all five reserved namespaces)
+if [ ! -f "$AGENT_DOC" ]; then
+    fail "T9" "$AGENT_DOC does not exist"
+else
+    t9_missing=""
+    for tok in "agent:<name>" "model:<id>" "session:<id>" "cost:<n>" "tokens:<n>"; do
+        if ! grep -F -q -- "$tok" "$AGENT_DOC"; then
+            t9_missing="$t9_missing $tok"
+        fi
+    done
+    if [ -z "$t9_missing" ]; then
+        ok "T9"
+    else
+        fail "T9" "$AGENT_DOC missing provenance tokens:$t9_missing"
+    fi
+fi
+
+# T10 — documents the DB resolution order
+if [ ! -f "$AGENT_DOC" ]; then
+    fail "T10" "$AGENT_DOC does not exist"
+else
+    t10_missing=""
+    for tok in "--db" "BRAGFILE_DB" "~/.bragfile/db.sqlite"; do
+        if ! grep -F -q -- "$tok" "$AGENT_DOC"; then
+            t10_missing="$t10_missing $tok"
+        fi
+    done
+    if [ -z "$t10_missing" ]; then
+        ok "T10"
+    else
+        fail "T10" "$AGENT_DOC missing db-resolution tokens:$t10_missing"
+    fi
+fi
+
+# T11 — carries the impact-framing convention (distinctive phrase)
+assert_contains_literal "T11" "$AGENT_DOC" "a metric or a named outcome"
+
+# T12 — gives the resolved per-client config paths
+if [ ! -f "$AGENT_DOC" ]; then
+    fail "T12" "$AGENT_DOC does not exist"
+else
+    t12_missing=""
+    for tok in ".mcp.json" "~/.claude.json" ".cursor/mcp.json" "claude_desktop_config.json"; do
+        if ! grep -F -q -- "$tok" "$AGENT_DOC"; then
+            t12_missing="$t12_missing $tok"
+        fi
+    done
+    if [ -z "$t12_missing" ]; then
+        ok "T12"
+    else
+        fail "T12" "$AGENT_DOC missing config-path tokens:$t12_missing"
+    fi
+fi
+
+# T13 — README links the page
+assert_contains_literal "T13" "README.md" "docs/for-ai-agents.md"
+
+# T14 — README has an agent/MCP section heading (line-regex avoids substring trap)
+if [ ! -f README.md ]; then
+    fail "T14" "README.md does not exist"
+elif grep -E -q '^## .*[Aa]gent' README.md; then
+    ok "T14"
+else
+    fail "T14" "README.md missing an agent/MCP '## ' section heading"
+fi
+
+# ===== finalise =====
+
+if [ "$FAIL_COUNT" -gt 0 ]; then
+    printf '\nFAILED: %d assertion(s) failed.\n' "$FAIL_COUNT" >&2
+    exit 1
+fi
+
+# F4 — harness self-pass meta (printed last, after all assertions OK)
+ok "F4"
+
+printf '\nALL OK: documentation-content assertions passed.\n'
+exit 0

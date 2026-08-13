@@ -1,0 +1,541 @@
+# AGENTS.md — Claude-Only Variant
+
+Instructions for Claude working across all phases of this repository. Read this file first, every session.
+
+> This variant assumes Claude plays every role: architect, implementer, reviewer. The context normally in a handoff document lives inside each spec's `## Implementation Context` section.
+
+> This file contains conventions only. For rules/constraints, see `/guidance/constraints.yaml`. For architectural rationale, see `/decisions/`. For waves of work against this app, see `/projects/`.
+
+---
+
+## 1. Repo Overview
+
+- **Repo (the app):** Bragfile (`brag` CLI, homebrew formula `bragfile`)
+- **Purpose:** Local-first Go CLI for engineers to capture and retrieve career accomplishments ("brags") for retros, reviews, and resumes. Stores entries in embedded SQLite at `~/.bragfile/db.sqlite`.
+- **Primary stakeholders:** solo developer (jysf). No other stakeholders in PROJ-001.
+- **Active project:** `PROJ-001-mvp` — ship a usable, distributable MVP via `brew install bragfile` within ~2 weeks.
+
+See `.repo-context.yaml` for structured metadata.
+
+---
+
+## 2. Work Hierarchy
+
+```
+REPO (the app — persists across all projects)
+ └─ PROJECT (a wave of work: "MVP", "improvements", "v2 redesign")
+     └─ STAGE (a coherent chunk within a project)
+         └─ SPEC (an individual task)
+```
+
+- The **repo** is the app. `AGENTS.md`, `/docs/`, `/guidance/`,
+  `/decisions/` live at repo level because they accumulate across all
+  projects.
+- A **project** (`/projects/PROJ-*/`) is a bounded wave of work.
+- A **stage** is an epic-sized chunk within a project (2–5 per project).
+- A **spec** is a single implementable task. Belongs to one stage in
+  one project.
+
+In this variant, Claude plays architect and implementer in **separate
+sessions**. The spec file itself carries all the context — see its
+`## Implementation Context` section.
+
+**Note on the `agents.architect` / `agents.implementer` front-matter
+fields:** under the `claude-only` variant these default to the same
+model id for every spec (informational only), so identical values in
+both fields are NOT evidence of same-session contamination — that
+would have to be inferred from commit/session timestamps instead.
+The fields become meaningful signal in the `claude-plus-agents`
+variant where separate agents occupy each role.
+
+**Decisions persist at repo level.** A decision made during PROJ-001
+binds PROJ-002 as well.
+
+**Specs do not cross project boundaries.**
+
+**ID numbering is repo-global and monotonic.** `PROJ-*`, `STAGE-*`,
+`SPEC-*`, and `DEC-*` IDs are all zero-padded, never reused, and **do
+not reset per project** — PROJ-002's first stage is `STAGE-006`
+(continuing PROJ-001's `STAGE-001`–`STAGE-005`), its first spec is
+`SPEC-025`. This keeps every ID globally unique, so a cross-project
+reference never needs a `PROJ-` qualifier to disambiguate. (Settled at
+PROJ-002 framing, 2026-06-05 — the first multi-project test surfaced
+that `new-stage.sh`/`new-spec.sh` were scoping `next_id` per-project,
+which would have reset both to `001`; the scripts now search repo-wide,
+matching how `DEC-*` already numbered.)
+
+---
+
+## 3. Tech Stack
+
+- **Language:** Go
+- **Runtime:** Go 1.26.x (latest stable; pinned via `go.mod` `go 1.26`). Update via `brew upgrade go`.
+- **Framework:** `spf13/cobra` for CLI argv + subcommands.
+- **Database:** SQLite 3, embedded, accessed via `modernc.org/sqlite` (pure Go, **no CGO**). See DEC-001.
+- **Testing:** Go stdlib `testing` package. Storage tests use `t.TempDir()` (enforced by `storage-tests-use-tempdir` constraint).
+- **Linter / Formatter:** `gofmt` (enforced) + `go vet`. `golangci-lint` welcome but not required in CI yet.
+- **Hosting:** None. Local CLI only.
+- **Distribution:** `goreleaser` → GitHub Releases → homebrew tap at `github.com/jysf/homebrew-bragfile`. Install via `brew install jysf/bragfile/bragfile`.
+- **CI:** GitHub Actions (to be set up in STAGE-005). Must run `go test ./...` and `gofmt -l .` and fail on any diff.
+
+---
+
+## 4. Commands (exact)
+
+These are the APP's commands. For template/workflow commands, see `justfile`.
+
+```bash
+# --- once, to bootstrap (SPEC-001 creates go.mod; nothing to install until then) ---
+go mod download                              # install module deps after go.mod exists
+
+# --- daily development ---
+just build                                   # build ./brag in repo root (wraps `go build ./cmd/brag`)
+just install                                 # install brag to ~/go/bin (wraps `go install ./cmd/brag`)
+just uninstall                               # remove installed brag binary
+just test                                    # run all tests (wraps `go test ./...`)
+just run -- list                             # run without installing (e.g. `just run list`, `just run add --title "x"`)
+# direct-go equivalents are also fine:
+go build ./cmd/brag                          # build binary into ./brag
+go install ./cmd/brag                        # install to $GOBIN (default ~/go/bin)
+go run ./cmd/brag <args>                     # run without building
+go test ./...                                # run all tests
+go test ./internal/storage -run TestAdd -v   # run a single test in a package
+gofmt -w .                                   # format (write in place)
+gofmt -l .                                   # lint (list unformatted files; CI fails if non-empty)
+go vet ./...                                 # static checks
+
+# --- release (STAGE-005) ---
+goreleaser release --clean                   # full release (tag triggers this in CI)
+goreleaser build --snapshot --clean          # local cross-compile smoke test
+
+# --- runtime (once built) ---
+./brag --version
+./brag add --title "..."
+./brag list
+```
+
+macOS note: `brew upgrade go` to move to the latest Go. `brew install goreleaser` before tagging a release locally.
+
+**Release tagging — dual-tag-on-same-commit gotcha** (lesson earned at v0.1.0 cut, 2026-05-11). Goreleaser inspects git state to determine "what tag am I building?" and does NOT reliably pick the right tag when multiple tags point at the same commit. Symptom: pushing `v0.1.0` after `v0.1.0-rc1` (both pointing at the same SHA) makes goreleaser pick `v0.1.0-rc1`, try to re-upload its existing release assets, and fail with `422 Validation Failed [Code: already_exists]`. Two valid patterns:
+
+1. **Delete the RC tag + release before cutting the final tag at the same commit.** Use this when the RC commit is the one you want to ship verbatim. Recovery commands: `gh release delete vX.Y.Z-rcN --yes --cleanup-tag`, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+2. **Cut the final tag from a separate commit** (e.g. one small post-RC tweak). Use this when there's a real reason to ship a different tree than the RC.
+
+Default to pattern 1 — simpler and matches the common case of "RC validated the workflow, ship the same tree."
+
+**macOS Gatekeeper on unsigned binaries** (lesson earned at v0.1.0 smoke-test, 2026-05-11). Without an Apple Developer ID code-signing certificate, goreleaser-produced darwin binaries trigger Gatekeeper's `"Apple could not verify 'brag' is free of malware…"` prompt on first run after `brew install`. The cask install path doesn't auto-clear quarantine. Two paths:
+
+1. **Document the workaround.** Each macOS user runs `sudo xattr -dr com.apple.quarantine /opt/homebrew/Caskroom/<cask>/` once per install/upgrade. Cheap; the friction is real but bounded. README's "macOS Gatekeeper note" section covers this for end users.
+2. **Add signing + notarization.** Requires Apple Developer Program enrollment ($99/year), Developer ID Application cert, app-specific password, goreleaser `signs:`/`notarize:` blocks, and a `macos-latest` runner step in release.yml. Deferred to backlog under "macOS code signing + notarization" — revisit if/when adoption matters or Apple Developer is acquired for another reason.
+
+For personal-scale CLI distribution, default to pattern 1.
+
+**Homebrew 6.0+ third-party tap trust** (lesson earned at v0.2.0 cut, 2026-06-19). Starting with Homebrew 6.0, installing a cask *or formula* from a third-party tap fails with `Refusing to load cask <tap>/<cask> from untrusted tap` until the user runs `brew trust --cask <tap>/<cask>` once. This is a **tap-level** trust policy — a third-party tap can execute arbitrary unsandboxed Ruby, so Homebrew gates the tap source itself — which makes it independent of two other frictions it is easy to conflate with: notarizing the binary does **not** remove it (that is a macOS Gatekeeper concern, see above), and switching the goreleaser artifact from a cask to a formula does **not** avoid it either (researched at the v0.2.0 cut — the gate is on the tap source, not the artifact type). For `brag`: the user runs `brew trust --cask jysf/bragfile/bragfile` once, then `brew install jysf/bragfile/bragfile`. Two follow-throughs: document it as a one-time install step in the README (done — README install section), and add a "check the package manager's current install/trust policy" line to the release pre-flight, since this gate appeared between the v0.1.0 and v0.2.0 cuts with no change on our side.
+
+**Release specs must include the runtime/operational pre-flight checklist** (the release-cut spec template, `projects/_templates/spec-release-cut.md`). Every production escape in PROJ-001..003 was operational/runtime (goreleaser dual-tag, Gatekeeper, brew-trust, prod-DB migration); the checklist makes each one a ticked design-time item, not a re-learned prod surprise.
+
+---
+
+## 5. Directory Structure
+
+```
+/
+├── AGENTS.md                          # This file
+├── CLAUDE.md                          # Pointer to AGENTS.md
+├── README.md                          # Human-facing readme
+├── GETTING_STARTED.md                 # First-project walkthrough
+├── FIRST_SESSION_PROMPTS.md           # Phase prompts
+├── .repo-context.yaml                 # Repo (app) metadata
+├── .variant                           # "claude-only"
+├── justfile                           # Commands: just status, just new-spec, etc.
+├── scripts/                           # Shell scripts powering justfile
+├── docs/                              # Architecture, data model, API contract
+├── guidance/                          # Repo-level rules (across all projects)
+│   ├── constraints.yaml
+│   └── questions.yaml
+├── decisions/                         # Repo-level DEC-* (across all projects)
+├── projects/                          # Waves of work
+│   ├── _templates/                    # Shared templates
+│   │   ├── spec.md
+│   │   ├── stage.md
+│   │   └── project-brief.md
+│   ├── PROJ-001-<slug>/
+│   │   ├── brief.md
+│   │   ├── stages/
+│   │   └── specs/
+│   │       └── done/
+│   └── PROJ-002-<slug>/
+├── cmd/
+│   └── brag/                          # CLI entrypoint (main package)
+└── internal/                          # implementation packages (not importable externally)
+    ├── cli/                           # one file per subcommand; no SQL here
+    ├── config/                        # --db / BRAGFILE_DB / default resolution
+    ├── storage/                       # Store, Entry, embedded migrations
+    │   └── migrations/                # NNNN_*.sql, embedded via embed.FS
+    ├── editor/                        # (STAGE-002) $EDITOR launch + markdown parse
+    └── export/                        # (STAGE-003) markdown + sqlite-file exporters
+```
+
+---
+
+## 6. Cycle Model
+
+Every spec moves through five cycles. **Cycles are tags, not gates**.
+
+| Cycle | Purpose |
+|---|---|
+| **frame** | Go/no-go on the spec |
+| **design** | Write the spec + failing tests + implementation context |
+| **build** | Make failing tests pass |
+| **verify** | Review + validation in one pass |
+| **ship** | Merge, deploy, reflect, archive |
+
+Valid transitions:
+```
+frame → design → build → verify → ship
+                   ↑       │
+                   └───────┘ (verify sends back on punch list)
+```
+
+**In this variant**, use **separate Claude sessions** for each cycle.
+A fresh session prevents design-phase context from contaminating build
+decisions, and a fresh verify session catches drift a continuation
+session wouldn't.
+
+Project and stage lifecycles are lighter:
+- **Project status:** `proposed | active | shipped | cancelled`
+- **Stage status:** `proposed | active | shipped | cancelled | on_hold`
+
+---
+
+## 7. Cross-Reference Rules
+
+Every spec has these relationships, encoded in front-matter:
+- `project.id` → the project it belongs to
+- `project.stage` → the stage within that project
+- `references.decisions` → DEC-* it was designed against
+- `references.constraints` → constraints that apply
+
+DECs are stable; specs come and go. DECs don't reciprocally list specs.
+
+---
+
+## 8. Coding Conventions
+
+- **Naming:** standard Go. Exported identifiers in `CamelCase`, unexported in `camelCase`. Package names are short, lowercase, no underscores (`cli`, `storage`, `config`).
+- **File organization:** one subcommand per file under `internal/cli/` (`add.go`, `list.go`, …). One concept per file under `internal/storage/` (`store.go`, `entry.go`, `migrate.go`).
+- **Imports:** `gofmt`-sorted. Grouped by stdlib / third-party / internal with a blank line between groups.
+- **Error handling:** wrap with context: `fmt.Errorf("add entry: %w", err)`. Return errors; don't panic. No custom error types in PROJ-001 unless a DEC justifies one.
+- **Logging:** none in MVP. If we ever add structured logging it gets a dedicated DEC. CLI talks to users via stdout/stderr directly (see `stdout-is-for-data-stderr-is-for-humans` constraint).
+- **No SQL outside `internal/storage`.** Enforced by the `no-sql-in-cli-layer` constraint.
+- **Comments:** Explain *why*, not *what*. No doc comments on unexported helpers unless they are non-obvious.
+- **No dead code.** Delete, don't comment out.
+
+---
+
+## 9. Testing Conventions
+
+- Every new exported function gets at least one test.
+- Test file naming: Go convention — `foo_test.go` next to `foo.go` in the same package.
+- Storage tests use `t.TempDir()` for the DB path. Never touch `~/.bragfile`.
+- CLI command tests construct a `*cobra.Command` with in-memory buffers for stdout/stderr and assert on them, not on the host's terminal. Use **separate `outBuf` and `errBuf`** (`cmd.SetOut(&outBuf)` / `cmd.SetErr(&errBuf)`) and assert no cross-leakage — e.g., a `--version` test must assert `errBuf.Len() == 0` in addition to the stdout substring check. This enforces the `stdout-is-for-data-stderr-is-for-humans` constraint at the test layer. Lesson earned in SPEC-001 verify punch list (2026-04-20).
+- Time-based ordering tests must use a monotonic tie-break column (e.g., `id DESC` under DEC-005) in addition to `created_at DESC`. Sleep-based timestamp separation alone is insufficient because RFC3339 is second-precision — a test that sleeps 10ms between rows will see identical `created_at` strings and produce non-deterministic ordering without a tie-break. Lesson earned in SPEC-002 build reflection (2026-04-20).
+  - **Addendum for freshness assertions:** the same rule applies to tests proving a row is freshly created (not inherited from input): assert on `new.ID != source.ID`, not on `new.CreatedAt != source.CreatedAt`. Time-based inequality requires an artificial `sleep`; ID-based inequality does not, and `AUTOINCREMENT` guarantees monotonicity. The ordering and freshness cases are two faces of the same rule: RFC3339 is second-precision, so use the monotonic column for any distinctness assertion. Lesson earned in SPEC-017 verify (2026-04-24): `TestAddCmd_JSON_RoundTripWithListJSON` carried a 1s `sleep` + `CreatedAt.Equal` check that was redundant with the server-field test's frozen-timestamp comparison and added CI-flake surface for zero additional coverage.
+- **Shell test scripts treat `--exclude-dir` as decorative.** BSD grep (the macOS default) matches basenames, not path fragments — `--exclude-dir=docs/reports` is a silent no-op because no directory has a basename containing `/`. The correctness boundary is an explicit whitelist of tolerable hit paths via a `case` post-filter, not the `--exclude-dir` set. See `scripts/test-docs.sh:340-358` for the canonical shape (E2 link-integrity assertion). Lesson earned in SPEC-021 build reflection Q3 (2026-04-25); codified at SPEC-021 ship after verify recommended codify-now-vs-watch (the rule is concrete, mechanical, and saves SPEC-022 + SPEC-024 from re-deriving it).
+- Coverage expectations: no hard threshold. Every storage method and every command has at least one happy-path and one error-path test. Migration runner has a "runs twice is a no-op" test.
+- **TDD:** Tests live in the spec's `## Failing Tests` section, written
+  during **design**, made to pass during **build**. Enforced by the `test-before-implementation` constraint.
+- In build: after writing the failing tests and before touching implementation, run `go test ./...` once and confirm the tests fail for the *expected* reason (the assertion you wrote, not a stray compilation error or undefined-symbol). Catches spec defects at the cheapest moment. If fail-first reports an "unexpectedly passing" test, investigate before proceeding — usually the assertion is too weak (see next bullet). Lesson earned in SPEC-003 Q3 ship reflection and validated by SPEC-004 build (2026-04-20).
+- When a test asserts that help or documentation output contains a substring, pick a token that is unique to the content under test — e.g. a distinctive example phrase or an explicit label like `"Examples:"` — not a generic word that cobra or another auto-rendering layer may already produce. Generic substring asserts give false-positive passes: SPEC-005's `TestAdd_HelpShowsExamples` asserted `outBuf` contained `"brag add"` but cobra's `Usage: brag add [flags]` line already contains that string, so the test would have passed without the implementation. Lesson earned in SPEC-005 build reflection (2026-04-20).
+  - **Addendum for markdown heading-level assertions:** split into lines and test `ln == "# title"` rather than `strings.Contains(out, "# title")`. Every deeper heading is a superstring of a shallower one — `strings.Contains("### alpha-old\n", "# alpha-old")` returns `true` — so substring checks produce silent false-positives whenever the assertion shape is "heading at level N and NOT at level M." Use line-based equality when testing markdown heading level. Lesson earned in SPEC-015 build reflection (2026-04-24).
+- Every locked design decision in a spec's design-decisions section (or equivalent — e.g. "Locked design decisions" or "Design decisions inline") must have at least one corresponding entry in the spec's `## Failing Tests` that would fail if the decision weren't implemented. Decisions captured in prose without a paired test are aspirational, not enforced — historically they slip through build unnoticed. Lesson earned in SPEC-009 verify punch list (2026-04-21): decision #6 documented git `:cq` semantics in prose, no failing test mapped to it, build missed the behavior, verify caught it. During design: walk every numbered design decision and confirm at least one failing test would fail without the corresponding implementation.
+- The inverse also holds: when a locked decision **inverts or removes** existing behavior, enumerate the existing tests whose premise is invalidated by the change. List them under the spec's `## Outputs` as planned deletions (or planned rewrites), not build-time discoveries disclosed under Deviations. SPEC-010's decision #1 (no-flags → editor mode) inverted `TestAdd_MissingTitleIsUserError`'s premise; build correctly deleted the test, but the deletion was a discovery rather than a plan. A two-minute "premise audit" during design — walk each locked decision against existing tests in the affected files — makes the symmetric design-to-test traceability explicit. Lesson earned in SPEC-010 ship reflection (2026-04-21).
+- The additive case also counts: when a spec **adds to a tracked collection** (migrations, DECs, constraints, queued entries, or any fixed-shape structure whose count is asserted in existing tests), grep for literal-count assertions in existing tests and enumerate them as planned updates under `## Outputs`. Example: SPEC-011 added `0002_add_fts.sql` as a second migration; `TestOpen_MigrationsTracked` asserted "exactly 1 row in `schema_migrations`" and was broken by the addition without any behavior being inverted. Concrete heuristic: when adding anything to `schema_migrations`, the DECs list, or `constraints.yaml`, run `grep -rn "<collection>" internal/**/*_test.go` and audit each hit for literal count coupling. Lesson earned in SPEC-011 ship reflection (2026-04-22).
+- The documentation-consistency case also counts: when a spec **changes a feature's shipping status** (e.g., strikes a row from a "not yet shipped" table, introduces a new command, removes a deprecated one), grep all docs for mentions of the feature name and enumerate every hit as a planned update under `## Outputs` — not just the primary status claim. Example: SPEC-012 struck `search` from `docs/tutorial.md` §9's "What's NOT there yet" table (the *primary* status claim) but missed the Scope blurb at line 3 of the same file (a *secondary* status claim). Verify caught the inconsistency. Concrete heuristic: when changing a feature's status, run `grep -rn "<feature-name>" docs/ README.md` and audit each hit for status claims. Lesson earned in SPEC-012 ship reflection (2026-04-22). Completes the three-case premise audit: **inversion/removal → planned test deletion; addition → planned count-bump; status change → planned doc references update.**
+- **Audit-grep cross-check (both sides) — enumeration without execution is aspirational.** *Design-side:* when you write a premise-audit grep in the spec, RUN it against the repo and reconcile actual hits against the spec's enumerated `## Outputs` list. If the grep surfaces hits the enumeration missed, add them to Outputs before locking the spec. *Build-side:* before doing the doc-sweep, re-run the spec's audit greps yourself; treat any delta between actual hits and the spec's enumerated Outputs as a question for the spec author (raise in build-cycle reflection or a quick clarifying check), not as a unilateral expansion of scope. SPEC-018 spec enumerated two greps (`tap.*STAGE-004` scoped to `AGENTS.md`; `STAGE-003.*summary` scoped to `docs/` + `README.md` + `AGENTS.md`) with expected-hit lists, but neither was executed at design — the first against the whole repo would have caught `AGENTS.md:67` (and adjacent `:68`); the second would have caught `docs/architecture.md:24` and `docs/tutorial.md:453`. Build held the line ("if the spec doesn't say it, don't do it") and flagged in reflection; verify caught the gap and recommended the cross-check both ways. Completes the premise-audit family: **design enumerates → design verifies its enumeration → build re-verifies and questions deltas.** Lesson earned in SPEC-018 ship reflection (2026-04-25).
+- **`os`-level calls go through an injectable package var so tests can substitute them.** Any call into process/host state that a test needs to control — `os.Getwd`, `os.Getenv`, the wall clock — is referenced through a package-level `var` (e.g. `var getCwd = os.Getwd`, `var clock = time.Now`), not called directly, so a test can swap it for a deterministic stub and restore it after. This keeps cwd-/env-/time-dependent behavior testable without touching the real working directory, environment, or clock, and without a `t.Chdir`/`os.Setenv` dance that leaks across tests. Three same-outcome confirming cases, each a literal-artifact CLI/storage spec that had to add the seam its prose omitted: SPEC-031 (`getCwd` for `brag project here` cwd resolution), SPEC-032 (`addGetCwd` for `brag add` `--project` auto-fill), and SPEC-036 (`clock` for the migration auto-backup sidecar's UTC timestamp). Codified at STAGE-008 close (2026-06-19), N=3 same-outcome. This is a testing-conventions habit, not a blocking constraint — there is no enforcing check; the payoff is a clean test seam at the moment os-state enters the code.
+
+---
+
+## 10. Git and PR Conventions
+
+- **Branch:** `feat/spec-NNN-<slug>` for feature specs. `fix/spec-NNN-<slug>` for bug specs. `chore/<slug>` is acceptable for non-spec infra work (e.g., CI changes).
+- **One spec per branch, one PR per branch.** Enforced by the `one-spec-per-pr` constraint.
+- **Commits:** Conventional-style short subject. `feat(storage): add Entry type`, `fix(cli): exit 1 when --title empty`, `docs: update architecture.md`, `chore(ci): add go-test job`. Body optional; when present, explain *why*. Avoid "WIP" commits on branches that will be opened as PRs — squash or rebase first.
+- **PR description must include:**
+  - Project: `PROJ-001`
+  - Stage: `STAGE-NNN`
+  - Spec: `SPEC-NNN`
+  - Decisions referenced, constraints checked, new `DEC-*` files
+- Do not force-push to `main`. Branch protection on `main` should require PR + passing CI.
+- **`.gitignore` for compiled binaries must be anchored.** Write `/brag`, not `brag` — an unanchored pattern matches every `brag` path at any depth and will silently shadow a directory of the same name (e.g., `cmd/brag/`). Lesson earned in SPEC-003 build reflection (2026-04-20, when SPEC-001's unanchored `brag` pattern hid `cmd/brag/main.go`).
+- **Push between local commits and merge.** Any commit added to a feat branch just before `gh pr merge --squash --delete-branch` MUST be pushed to `origin/<feat-branch>` before the merge. GitHub squashes what's on the remote branch, not what's on local; `--delete-branch` then orphans the unpushed commit (recoverable only via `git reflog` / `git cat-file`). Three confirming cases: SPEC-013 push-after-design slip; SPEC-018 unpushed chore-bundle slip; SPEC-019 orphaned reflection commit recovered at STAGE-004 ship. Heuristic: after any `git commit` on a feat branch in the same shell session as the PR merge, run `git push origin HEAD` before `gh pr merge`. Codified at STAGE-005 framing (2026-04-25).
+
+---
+
+## 11. Domain Glossary
+
+- **aggregate** — the Go package `internal/aggregate/` (introduced in STAGE-004 by SPEC-018). Pure data layer that maps `[]storage.Entry → structured stats` (`ByType`, `ByProject`, `GroupForHighlights`, plus SPEC-019's `GroupEntriesByProject` helper and SPEC-020's `Streak` / `MostCommon` / `Span`). Rendering is the responsibility of `internal/export`; aggregate stays SQL-free and dependency-free.
+- **brag / entry** — one captured moment worth remembering for a retro, review, or resume. Single row in the `entries` table.
+- **capture** — the act of creating an entry, either via `brag add --title ...` (flags form) or `brag add` with no args opening `$EDITOR` on a templated markdown buffer (STAGE-002).
+- **digest** — collective name for the rule-based commands (`brag summary`, `brag review`, `brag stats`) that emit a single-document aggregation per DEC-014's envelope shape. Distinct from `brag export`, which emits a multi-entry document. STAGE-004.
+- **Store** — the `*storage.Store` Go type that owns the `*sql.DB` and all typed methods. The only package that imports a SQL driver.
+- **migration** — a single `NNNN_*.sql` file under `internal/storage/migrations/`, embedded into the binary, applied automatically in lexical order on `storage.Open`.
+- **export** — a one-shot dump of entries, either as a Markdown report (stdout or `--out file.md`) or as a portable SQLite file copy (via `VACUUM INTO`).
+- **review** — `brag review --week | --month`: prints recent entries grouped by project followed by three hard-coded reflection questions ("What pattern do you see in this period?", "What did you underestimate?", "What's missing here that should be?"). Markdown elides per-entry descriptions for compactness; JSON includes the full DEC-011 entry shape. Designed to be pasted into an external AI session for guided self-reflection. STAGE-004 (SPEC-019).
+- **summary** — a rule-based (non-LLM) aggregation of entries grouped by project/type over a rolling 7- or 30-day time window (`brag summary --range week|month`). STAGE-004.
+- **stats** — `brag stats`: six lifetime aggregations (total entries, entries/week rolling average, current streak, longest streak, top-5 most-common tags, top-5 most-common projects, corpus span). STAGE-004 (SPEC-020).
+- **tap** — a homebrew tap repo (`github.com/jysf/homebrew-bragfile`) hosting the `bragfile.rb` formula. Created in STAGE-005.
+- **wrapped** — `brag wrapped [<year>] [Q<n>]`: a shareable, celebratory year- or quarter-in-review digest over a **named** calendar period (default: the current calendar year). The fifth DEC-014 consumer. Unlike `impact`'s `[cutoff, now]` window, `wrapped`'s window is BOUNDED on both ends (`[period-start, next-boundary)`) so a completed year/quarter does not spill past its end. Section arc: Cadence (busiest month + a default-on markdown `sparkline` + per-month `series`) → Top initiatives → Impact moments → Rhythm (longest streak, top tags/types) → Span. PROJ-004 STAGE-013 (SPEC-051), DEC-030; the cadence sparkline is SPEC-052/DEC-031.
+- **sparkline** — the Go package `internal/spark/` and its `spark.Line([]int) string` primitive (SPEC-052/DEC-031): a fixed-width Unicode block-glyph string (`▁▂▃▄▅▆▇█`, one glyph per element) computed by min→max linear normalization (`level = round((v-min)/(max-min)*7)`), pure and stdlib-only (`math`, no dependency). `brag wrapped`'s markdown `## Cadence` section renders it as a `Cadence: <glyphs>` line over the zero-filled `cadence.series` counts — default-on, suppressed by `--no-spark` or a present `NO_COLOR` env var (read through the injectable `lookupSparkEnv` package var). Markdown-only: JSON stays raw counts, no glyphs. Empty/flat series → `""`/all `▁`. `stats`/`impact` are deferred (no cadence-series slot). `brag coverage` also renders it — as an `Agent share: <glyphs>` line over the per-month agent share (SPEC-045). PROJ-004 STAGE-013.
+- **--previous** — a boolean window modifier (SPEC-053/DEC-032) shared across `brag impact`, `brag story`, and `brag wrapped` that shifts the selected calendar window from the CURRENT (in-progress) period to the LAST-COMPLETED one, as a BOUNDED `[prev-start, prev-end)` window whose exclusive upper bound is the current period's start (so current-period entries are excluded). The previous-period start is the current-period start shifted back one period via `time.Date`+`AddDate` (never day subtraction; rolls year boundaries). On `impact`/`story` it routes through the extended `windowCutoff` (a `previous bool` param + an exclusive-`end` return; zero `end` = the unchanged current-period path) and requires a window flag on `impact` (a modifier is not a window) while shifting the profile default on `story`; the `scope` echoes `quarter:previous`/`month:previous`/`year:previous`. On `wrapped` it is `now.Year()-1` fed through the existing `parseWrappedPeriod` year path (annual-only; `scope` is the concrete year, e.g. `2025`), valid only with no positional period. INCOMPATIBLE with `--since` (impact/story) or an explicit positional period (wrapped) → `UserError`. PROJ-004 STAGE-013. (`brag coverage` also joins this shared family via `windowCutoff`.)
+- **coverage** — `brag coverage --quarter|--month|--year|--since <date> [--previous]`: a rule-based digest of **provenance share** — how much of the corpus over a calendar window is agent-authored vs human-authored, a per-month trend, and a self-reference (dogfooding) density. The SIXTH DEC-014 consumer (SPEC-045/DEC-033), reusing the shared calendar window (DEC-028) + `--previous` (DEC-032). Body: `## Provenance share` (agent/human counts + %) → `## Monthly trend` (a default-on markdown agent-share `sparkline` over share×100 + a zero-filled per-month `agent / human (%)` series) → `## Self-reference` (entries whose title/description contain `brag`, case-insensitive substring). The agent classifier is **single-sourced** with `brag list --author`: a pure `aggregate.IsAgentAuthored(storage.Entry) bool` predicate kept in agreement with storage's SQL `provenanceExistsClause` by a cross-package drift-guard test (`TestProvenanceClassifier_GoPredicateMatchesSQLClause`); coverage reads all in-window rows once and classifies in Go (it needs BOTH classes for a share), so it does NOT set `ListFilter.Author`. Sparkline is markdown-only (JSON keeps raw counts+shares, DEC-031 choice f), suppressed by `--no-spark`/`NO_COLOR`. PROJ-004 STAGE-013.
+
+---
+
+## 12. Cycle-Specific Rules
+
+### During **design**
+
+Spec prose cannot relax a blocking constraint. When a spec's "Notes for
+the Implementer" offers multiple implementation approaches ("Either A or
+B is acceptable"), each option must pass the `/guidance/constraints.yaml`
+list independently. Mentally run each option against the blocking
+constraints for the paths it would touch before writing "either is
+acceptable"; if one option would violate a blocking rule, it is not
+actually an option and the spec should prescribe the compliant path
+directly. Lesson earned in SPEC-007 verify punch list (2026-04-20): the
+spec offered a test-helper choice where one option imported `database/sql`
+under `internal/cli/`, violating `no-sql-in-cli-layer` — verify caught
+it, punch-list iteration fixed both the code and the spec.
+
+**Decide at design time when decidable.** When a "multiple paths" choice
+is decidable at design time — meaning one path violates a blocking
+constraint, encodes a structural anti-pattern, or duplicates a known
+lesson — lock the prescribed path AND list the rejected alternatives
+explicitly under `## Locked design decisions` (a "Rejected alternatives
+(build-time)" subsection works well). "Either-is-fine" is the off-load
+that 90% of the time slips into Deviations later. Three confirming data
+points: SPEC-007 verify (test-helper either-A-or-B that violated a
+blocking constraint under one branch); SPEC-014 build (TSV-helper
+placement decision off-loaded to build); SPEC-017 ship reflection
+("either-is-fine off-loads to build" pattern named, with the 1s sleep
++ `CreatedAt.Equal` retained-by-path-of-least-resistance as the
+example). SPEC-018 was the first spec to apply this discipline
+proactively: a Rejected-alternatives-build-time section enumerated three
+paths (`Store.SetCreatedAtForTesting` rejected as test-only public API
+in production; inline `--range` parsing rejected in favor of named
+`rangeCutoff` helper for cleaner locked-decisions-need-tests pairing;
+`echoFilters` reuse rejected pre-third-caller-threshold), and build
+held all three. Lesson earned in SPEC-018 ship reflection (2026-04-25).
+
+**NOT-contains assertions need a self-audit grep against load-bearing prose.**
+When a Failing Test asserts output DOES NOT contain `"X"`, grep the spec's
+load-bearing text (the Long / help-rendering / doc-rendering prose that the
+implementer types into the binary) for `X` at design time. Hits in load-bearing
+prose are bugs to fix BEFORE locking. Hits in commentary or design-justification
+prose are fine — those don't reach the binary. Two confirming cases: SPEC-019
+build self-caught its own Long string containing `--tag` while the same spec's
+help-test asserted `--tag` absent (resolved at build by dropping `--` prefixes
+from the prose); SPEC-020 design pre-empted the same class proactively
+(eight forbidden tokens grep'd against locked Long, zero hits at design,
+zero false-positive hits at build). The scope clause is load-bearing: a Go
+comment in the CLI source containing forbidden tokens is fine because comments
+don't render to `--help`; a sentence in the cobra `Long` string is not. Lesson
+earned across SPEC-019 ship reflection (2026-04-25) and SPEC-020 design
+(2026-04-25); codified at SPEC-020 ship.
+
+**Literal-artifact-as-spec for fixed-shape deliverables.** When a spec ships a
+fixed-shape artifact decidable at design time (markdown file, JSON schema,
+YAML workflow, shell-script template, slash-command body, cobra `Long` string),
+embed the literal artifact under `## Notes for the Implementer` rather than
+describing it in prose. Build transcribes verbatim; verify diffs against the
+embedded literal. Both cycles become mechanical and fast, and design carries
+the cost of getting the artifact right at the moment alternatives are still
+cheap. Three confirming cases: SPEC-018 ship reflection (2026-04-25, Go test
+fixtures embedded verbatim and byte-loaded by goldens); SPEC-020 design
+(2026-04-25, cobra `Long` string locked literally with NOT-contains
+self-audit run against it); SPEC-021 ship reflection (2026-04-25, three full
+markdown files — README/CONTRIBUTING/development.md, 292 lines total —
+byte-transcribed from sketches with zero deviation). Codified at SPEC-021
+ship. The pattern applies where the artifact's shape is design-decidable; it
+does NOT apply where the artifact must be synthesised from constraints (most
+Go code) — there, prose-with-failing-tests stays the right shape.
+
+**Flag-default explicitness in literal-artifact CLI specs.** When a spec
+embeds a cobra command as a literal artifact (a `Long` string plus its flag
+set), state each flag's **default value**, not only its accepted values —
+`--format` accepts `json`, but does it default to `""` (plain) or `"json"`? A
+flag whose default is left implicit is a design-decidable choice off-loaded to
+build, which then guesses; the literal-artifact contract ("build transcribes
+verbatim, verify diffs") holds only if the default rides in the literal. Three
+same-outcome confirming cases: SPEC-026 (`--format ""` default stated
+explicitly, zero-cost), SPEC-028 (LD4 restated the `--format` default per the
+STAGE-006 WATCH item), SPEC-029 (the `edit` / `archive` / `delete` flag
+defaults all stated). Codified at STAGE-007 close (2026-06-12). This is the
+per-flag completeness counterpart to the §12(a) expected-value-literals rule:
+a flag's default is an expected value the spec must pin, not one build infers.
+
+**Design-time pre-flight: run embedded literals through their target tools.**
+When the literal-artifact-as-spec pattern embeds a literal whose validity
+depends on the current behavior of an external tool (a goreleaser config that
+must pass `goreleaser check`; a cobra-generated completion script whose
+expected markers depend on the cobra version in `go.mod`; a JSON Schema whose
+strict-reject behavior depends on a validator; an action workflow whose
+schema version depends on the runner's parser), **run the literal through
+the tool at design time** before declaring design done. The check is cheap
+at design (a few seconds of `goreleaser check`, a scratch program that
+invokes `cmd.GenBashCompletion(&buf)`, etc.) and prevents the entire
+build/verify/recovery cycle that surfaces when a literal embeds a stale
+assumption about an external tool's output. Two confirming cases, opposing
+outcomes, same sub-rule: SPEC-023 verify D3 NEGATIVE (2026-04-26 — design
+skipped pre-flight against `goreleaser check`; deprecated `brews:` →
+`homebrew_casks:` and `format:` → `formats:` keys surfaced at verify; cost a
+recovery commit on the feat branch plus the test-docs.sh group L assertion
+updates that had to follow); SPEC-024 design §12(b) POSITIVE (2026-05-10 —
+design ran a scratch Go program against cobra v1.10.2's `GenBashCompletion`,
+observed `__start_brag` not `_brag_completion()`, corrected the spec's
+failing-test markers AND noted the discrepancy explicitly under a new "§12(b)
+design-time verification" section in the spec; zero deviations at build).
+Codified at SPEC-024 ship (2026-05-10). The pattern pairs with the broader
+literal-artifact-as-spec rule above: design-time pre-flight is what makes
+"build transcribes verbatim, verify diffs" actually mechanical, because the
+literal was already validated against external reality at the moment it was
+embedded.
+
+**§12(b) refinement — target the behavioral surface, not the shape
+validator.** When a spec's literal makes a claim about runtime behavior —
+a component registers, a hook fires, a binary resolves on PATH, a server
+answers — the design-time pre-flight must run the literal through the
+tool surface that exercises that behavior, not merely the surface that
+validates the artifact's shape. Shape-validation and behavior-
+registration are different checks; neither substitutes for the other.
+Canonical pair: SPEC-024 ran cobra's actual GenBashCompletion
+(behavioral) and caught the __start_brag marker at design; SPEC-041 ran
+`claude plugin validate --strict` (shape-only) but not
+`claude plugin details` (registration), so a manifest that validated
+still registered zero MCP servers — the defect escaped to build. Earned
+N=2 paired-opposing (2026-07-04).
+
+**Design-time pre-flight covers the test's own expected-value literals, too —
+not just the artifact-under-test.** §12(b) validates the artifact a spec embeds
+by running it through its external tool. This sub-rule extends the same
+discipline to the *test assertions* a spec embeds: when a Failing Test
+hard-codes an expected value that is design-decidable — a sorted name list, a
+row/element count derivable from the migration/ETL, or a substring that must
+appear in another embedded literal — compute or run that expectation against
+its source at design, before declaring design done. A `want := []string{...}`
+whose order depends on a sort, a `count == N` that depends on the migration,
+and an `assert_contains "X"` whose `X` must match an embedded artifact are all
+design-decidable; typing them by hand defers a guaranteed-catchable error to
+build. Three same-outcome confirming cases (across two distinct specs; the
+first two are mechanically independent contradictions within one build):
+SPEC-023 build L2 (2026-04-26 — the `.goreleaser.yaml` literal put `version: 2`
+on line 6 while test L2 asserted it within `head -5`; the two embedded literals
+contradicted, caught on first build run); SPEC-023 build O4 (2026-04-26 — the
+CHANGELOG literal wrote `brag show <id>` while test O4 asserted the plain
+`brag show` substring; caught at build); SPEC-025 build (2026-06-07 —
+`TestFTS_TriggersExistAfterMigration`'s `want` was typed `tags_au` before
+`taggings_*`, but `sqlite_master`/`sort.Strings` order `taggings_*` first since
+`'g' < 's'`; the §12(b) pre-flight ran the migration SQL through the real driver
+but not the test's expected sorted list, so the order error surfaced at build).
+Codified at STAGE-006 close (2026-06-07).
+
+**Codification meta-rule: paired opposing-outcome cases earn codification at
+N=2; same-outcome confirming cases still need N=3.** Earned at PROJ-001 close
+(2026-05-17) from the §12(b) codification itself, which is the project's
+canonical instance: SPEC-023 verify D3 NEGATIVE (design skipped pre-flight
+against `goreleaser check`; deprecated `brews:` → `homebrew_casks:` keys
+surfaced at verify, paid a recovery commit) paired with SPEC-024 design
+§12(b) POSITIVE (design ran a scratch Go program against cobra v1.10.2's
+`GenBashCompletion`, caught a bash-marker assumption mid-design, zero
+deviations at build). Two cases, opposing outcomes, same mechanical sub-rule
+— that pairing carries more evidence than three same-outcome confirming
+cases because each outcome independently constrains the rule's shape: the
+negative case proves "skipping the pre-flight has a cost," the positive
+case proves "doing the pre-flight prevents the cost." Apply the meta-rule
+at any future codification decision: when a candidate rule has produced
+both a costly miss *and* a cheap save on the same mechanical surface,
+clear the bar at N=2; otherwise hold for N=3 (the same-outcome confirming-
+cases bar that codified §9 audit family, §10 push discipline, §12
+NOT-contains, §12 literal-artifact-as-spec, and most other AGENTS.md
+addenda).
+
+### During **build**
+
+Start a **new Claude session**. Do not continue from the design session.
+
+Before writing code:
+1. Read the spec's `## Implementation Context` section.
+2. Read every `DEC-*` it references.
+3. Read the parent `STAGE-*.md` and project `brief.md`.
+4. Read `/guidance/constraints.yaml`.
+5. If anything is ambiguous, add to `/guidance/questions.yaml` and stop.
+
+When done:
+1. Fill in spec's `## Build Completion` (including reflection).
+2. `just advance-cycle SPEC-NNN verify`.
+3. Create `DEC-*` files for non-trivial build decisions.
+4. Open PR.
+
+### During **verify**
+
+Start **another new Claude session**. Do not reuse build session.
+
+Check: acceptance criteria met? tests pass? no decision drift? no
+constraint violations? non-trivial choices have DEC-*? build reflection
+answered honestly?
+
+Output: ✅ APPROVED / ⚠ PUNCH LIST / ❌ REJECTED.
+
+### During **ship**
+
+Append `## Reflection` to spec. Three answers. Then
+`just archive-spec SPEC-NNN`. If stage backlog is complete, run the
+Stage Ship prompt.
+
+---
+
+## 13. Session Hygiene (claude-only specific)
+
+Because one agent plays multiple roles, context contamination is a real
+risk. Four habits keep it at bay:
+
+1. **New session per cycle where possible.** Especially design → build
+   and build → verify.
+2. **Never reference "as I said earlier"** in later cycles. The spec
+   is the source of truth.
+3. **Weekly review is non-optional.** Without a second agent pushing
+   back, drift compounds silently. Run `just weekly-review`.
+4. **Honest confidence values on decisions.** See Section 14.
+
+---
+
+## 14. Confidence Discipline
+
+Decisions have an `insight.confidence` field (0.0–1.0). Honest values drive:
+
+- **Design:** decisions at confidence < 0.7 also create a question in
+  `/guidance/questions.yaml`.
+- **Verify:** specs referencing decisions at confidence < 0.6 get a
+  yellow flag.
+- **Weekly review:** all decisions < 0.8 are listed with strength/weakness trend.
+
+Most decisions should land between 0.7 and 0.95. 1.0 only for truly locked choices.
+
+---
+
+## 15. Pointers
+
+- Constraints: `/guidance/constraints.yaml`
+- Open questions: `/guidance/questions.yaml`
+- Decisions: `/decisions/`
+- Projects: `/projects/`
+- Templates: `/projects/_templates/`
+- Architecture: `/docs/architecture.md`
+- Data model: `/docs/data-model.md`
+- CLI contract: `/docs/api-contract.md`
+- User tutorial (how to use `brag`): `/docs/tutorial.md`
+- Phase prompts: `/FIRST_SESSION_PROMPTS.md`
+- First walkthrough: `/GETTING_STARTED.md`
+- Daily commands: run `just --list`

@@ -1,0 +1,18 @@
+# Dependabot version updates — see
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# `gomod` watches go.mod for dep bumps.
+# `github-actions` watches .github/workflows/* and auto-PRs each time
+# an action publishes a new version — pairs with SHA-pinning per the
+# 2026-04-26 pre-distribution security review (M2/L5).
+
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
