@@ -221,6 +221,43 @@ func TestShowCmd_NonPositiveArgIsUserError(t *testing.T) {
 	}
 }
 
+// TestShowCmd_PipeInMetadataIsEscaped 锁定 brag show 对 tags/project/
+// type/impact 中的竖线做表格转义:输出行仍是两列,竖线显示为 \|。
+// 回归 show 路径(renderEntry 经 export.RenderEntry)。
+func TestShowCmd_PipeInMetadataIsEscaped(t *testing.T) {
+	root, dbPath := newRootWithShow(t)
+	id := seedEntry(t, dbPath, storage.Entry{
+		Title:   "has pipes",
+		Tags:    "a|b",
+		Project: "platform|core",
+		Type:    "shipped|learned",
+		Impact:  "cut p99 | unblocked mobile",
+	})
+
+	var outBuf, errBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"--db", dbPath, "show", strconv.FormatInt(id, 10)})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if errBuf.Len() != 0 {
+		t.Fatalf("expected stderr to be empty, got %q", errBuf.String())
+	}
+	out := outBuf.String()
+	for _, want := range []string{
+		"| tags        | a\\|b |",
+		"| project     | platform\\|core |",
+		"| type        | shipped\\|learned |",
+		"| impact      | cut p99 \\| unblocked mobile |",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected escaped row %q, got %q", want, out)
+		}
+	}
+}
+
 func TestShowCmd_HelpShape(t *testing.T) {
 	root, _ := newRootWithShow(t)
 	var outBuf, errBuf bytes.Buffer

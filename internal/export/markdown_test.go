@@ -475,6 +475,111 @@ func TestToMarkdown_SummaryCountsAndSorting(t *testing.T) {
 	}
 }
 
+// TestRenderEntry_PipeInMetadataIsEscaped 锁定 tags/project/type/impact
+// 字段值里的竖线必须被转义为 \|,否则一行表格会被竖线拆成多列,
+// 生成的 Markdown 无法正确渲染。show 与 export 共用 RenderEntry,
+// 在此层修复即覆盖两条路径。
+func TestRenderEntry_PipeInMetadataIsEscaped(t *testing.T) {
+	e := storage.Entry{
+		ID:        7,
+		Title:     "has pipes",
+		Tags:      "a|b",
+		Project:   "platform|core",
+		Type:      "shipped|learned",
+		Impact:    "cut p99 | unblocked mobile",
+		CreatedAt: time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC),
+	}
+
+	var buf bytes.Buffer
+	RenderEntry(&buf, e, 1)
+	got := buf.String()
+
+	// 转义后的字面量必须出现:字段值中的 | 已变成 \|。
+	for _, want := range []string{
+		"| tags        | a\\|b |",
+		"| project     | platform\\|core |",
+		"| type        | shipped\\|learned |",
+		"| impact      | cut p99 \\| unblocked mobile |",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want escaped row %q, got:\n%s", want, got)
+		}
+	}
+
+	// 每个元数据行必须仍是恰好两列:形如 "| k | v |",含 3 个
+	// 列分隔竖线(首/中/尾)。字段值中的竖线已转义为 \|,不计入裸竖线。
+	for _, ln := range strings.Split(got, "\n") {
+		if !strings.HasPrefix(ln, "| tags") &&
+			!strings.HasPrefix(ln, "| project") &&
+			!strings.HasPrefix(ln, "| type") &&
+			!strings.HasPrefix(ln, "| impact") {
+			continue
+		}
+		barePipes := countBarePipes(ln)
+		// 一个两列表格行形如 "| k | v |",含 3 个列分隔竖线(首/中/尾)。
+		// 字段值中的竖线已被转义为 \|,不计入裸竖线,故恒为 3。
+		if barePipes != 3 {
+			t.Errorf("metadata row should have 3 column-separating pipes, got %d: %q", barePipes, ln)
+		}
+	}
+}
+
+// countBarePipes 统计未被反斜杠前置的竖线数量,用于判定表格列数。
+func countBarePipes(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '|' && (i == 0 || s[i-1] != '\\') {
+			n++
+		}
+	}
+	return n
+}
+
+// TestToMarkdown_PipeInMetadataSurvivesGrouped 锁定 export 的 grouped
+// 路径同样转义了元数据竖线——show/export 共用 RenderEntry 的回归证明。
+func TestToMarkdown_PipeInMetadataSurvivesGrouped(t *testing.T) {
+	entries := []storage.Entry{
+		{
+			ID: 1, Title: "piped", Tags: "x|y", Project: "alpha", Type: "shipped",
+			Impact:    "a | b",
+			CreatedAt: fixedNow, UpdatedAt: fixedNow,
+		},
+	}
+	got, err := ToMarkdown(entries, MarkdownOptions{Flat: false, Filters: "(none)", Now: fixedNow})
+	if err != nil {
+		t.Fatalf("ToMarkdown: %v", err)
+	}
+	for _, want := range []string{
+		"| tags        | x\\|y |",
+		"| project     | alpha |",
+		"| type        | shipped |",
+		"| impact      | a \\| b |",
+	} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("want escaped row %q in export, got:\n%s", want, got)
+		}
+	}
+}
+
+// TestRenderEntry_NoPipeUnchanged 锁定转义对无竖线字段是恒等变换,
+// 即现有 golden 行为不被破坏。
+func TestRenderEntry_NoPipeUnchanged(t *testing.T) {
+	var buf bytes.Buffer
+	RenderEntry(&buf, fixture[0], 1)
+	got := buf.String()
+	for _, want := range []string{
+		"| tags        | auth |",
+		"| project     | alpha |",
+		"| type        | shipped |",
+		"| impact      | did stuff |",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no-pipe row should be unchanged, want %q, got:\n%s", want, got)
+		}
+	}
+}
+
 func extractBetween(t *testing.T, s, start, end string) string {
 	t.Helper()
 	i := strings.Index(s, start)

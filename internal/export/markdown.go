@@ -44,16 +44,16 @@ func RenderEntry(w io.Writer, e storage.Entry, headingLevel int) {
 	fmt.Fprintf(w, "| created_at  | %s |\n", e.CreatedAt.UTC().Format(time.RFC3339))
 	fmt.Fprintf(w, "| updated_at  | %s |\n", e.UpdatedAt.UTC().Format(time.RFC3339))
 	if e.Tags != "" {
-		fmt.Fprintf(w, "| tags        | %s |\n", e.Tags)
+		fmt.Fprintf(w, "| tags        | %s |\n", escapeTableCell(e.Tags))
 	}
 	if e.Project != "" {
-		fmt.Fprintf(w, "| project     | %s |\n", e.Project)
+		fmt.Fprintf(w, "| project     | %s |\n", escapeTableCell(e.Project))
 	}
 	if e.Type != "" {
-		fmt.Fprintf(w, "| type        | %s |\n", e.Type)
+		fmt.Fprintf(w, "| type        | %s |\n", escapeTableCell(e.Type))
 	}
 	if e.Impact != "" {
-		fmt.Fprintf(w, "| impact      | %s |\n", e.Impact)
+		fmt.Fprintf(w, "| impact      | %s |\n", escapeTableCell(e.Impact))
 	}
 	if e.Description != "" {
 		fmt.Fprintf(w, "\n%sDescription\n\n%s\n", descPrefix, e.Description)
@@ -61,6 +61,15 @@ func RenderEntry(w io.Writer, e storage.Entry, headingLevel int) {
 }
 
 const noProjectKey = "(no project)"
+
+// escapeTableCell 转义会破坏 Markdown 表格结构的字符。竖线是列分隔符,
+// 必须前置反斜杠;反斜杠本身先转义,避免吞掉用户值里真实的反斜杠。
+// 仅作用于渲染层,存储与原始值保持不变。
+func escapeTableCell(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `|`, `\|`)
+	return s
+}
 
 // ToMarkdown renders entries as a review-ready markdown document per
 // DEC-013. Returns bytes with the trailing "\n" stripped; the CLI
